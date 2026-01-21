@@ -1,6 +1,37 @@
 [package]
 name = "knowledge-mcp"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+# MCP Server
+rmcp = { version = "0.13", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Markdown parsing with wiki-link support
+pulldown-cmark = "0.13"
+
+# Fast search (ripgrep internals)
+grep-regex = "0.1"
+grep-searcher = "0.1"
+regex = "1"
+
+# File traversal
+walkdir = "2"
+
+# Graph operations
+petgraph = "0.7"
+
+# Error handling & logging
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+anyhow = "1"
