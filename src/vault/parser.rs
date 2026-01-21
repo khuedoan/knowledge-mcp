@@ -1,3 +1,8 @@
+//! Markdown parsing with wiki-link extraction.
+//!
+//! This module parses markdown content using pulldown-cmark with wiki-link
+//! support, extracting links, headings, and document structure.
+
 use pulldown_cmark::{Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 
 use super::note::{Heading, WikiLink};
@@ -39,15 +44,13 @@ pub fn parse_markdown(content: &str) -> ParseResult {
         match event {
             // Handle wiki links
             Event::Start(Tag::Link {
-                link_type,
+                link_type: LinkType::WikiLink { has_pothole },
                 dest_url,
                 title: _,
                 id: _,
             }) => {
-                if let LinkType::WikiLink { has_pothole } = link_type {
-                    in_wiki_link = Some((dest_url.to_string(), has_pothole));
-                    wiki_link_text.clear();
-                }
+                in_wiki_link = Some((dest_url.to_string(), has_pothole));
+                wiki_link_text.clear();
             }
 
             // Capture text inside wiki link (this is the alias if has_pothole is true)

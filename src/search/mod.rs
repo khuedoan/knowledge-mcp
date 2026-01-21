@@ -1,8 +1,13 @@
+//! Full-text search functionality for the knowledge vault.
+//!
+//! This module provides fast content search using ripgrep internals,
+//! supporting both literal and regex pattern matching.
+
 use std::path::Path;
 
 use grep_regex::RegexMatcher;
-use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
+use grep_searcher::sinks::UTF8;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -91,7 +96,7 @@ pub fn search(
         let path = entry.path();
 
         // Only search markdown files
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
 

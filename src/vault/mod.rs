@@ -1,3 +1,8 @@
+//! Vault management for indexing and accessing markdown notes.
+//!
+//! This module provides the `Vault` struct which indexes all markdown files
+//! in a directory, extracting wiki links, headings, and metadata.
+
 pub mod note;
 pub mod parser;
 
@@ -87,9 +92,14 @@ impl Vault {
 
             // Only process markdown files
             if path.extension().is_some_and(|ext| ext == "md") {
-                if let Ok(note) = self.parse_note(path) {
-                    let key = note.name.to_lowercase();
-                    self.notes.insert(key, note);
+                match self.parse_note(path) {
+                    Ok(note) => {
+                        let key = note.name.to_lowercase();
+                        self.notes.insert(key, note);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse note {:?}: {}", path, e);
+                    }
                 }
             }
         }
@@ -215,7 +225,7 @@ impl Vault {
                     .any(|l| !l.target.is_empty() && self.note_exists(&l.target));
 
                 // No incoming links
-                let has_incoming = self.backlinks(&note.name).is_empty() == false;
+                let has_incoming = !self.backlinks(&note.name).is_empty();
 
                 !has_outgoing && !has_incoming
             })

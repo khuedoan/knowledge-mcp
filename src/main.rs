@@ -1,15 +1,7 @@
-mod config;
-mod graph;
-mod search;
-mod tools;
-mod vault;
-
-use rmcp::transport::stdio;
+use knowledge_mcp::{Config, KnowledgeServer};
 use rmcp::ServiceExt;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-
-use crate::config::Config;
-use crate::tools::KnowledgeServer;
+use rmcp::transport::stdio;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

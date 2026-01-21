@@ -1,19 +1,25 @@
+//! MCP tool implementations for the knowledge vault server.
+//!
+//! This module provides the main `KnowledgeServer` handler and all MCP tools
+//! for interacting with a knowledge vault of markdown notes.
+
 use std::sync::Arc;
 
 use rmcp::{
+    ServerHandler,
     handler::server::{tool::ToolCallContext, tool::ToolRouter, wrapper::Parameters},
     model::*,
     schemars, // Import the crate so derive macro can find it
-    service::{RequestContext, RoleServer},
+    service::{Peer, RequestContext, RoleServer},
     tool,
     tool_router,
-    ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
+use crate::filter::SensitiveDataFilter;
 use crate::graph::KnowledgeGraph;
 use crate::search::{self, SearchOptions};
 use crate::vault::{BrokenLink, Vault};
@@ -22,7 +28,10 @@ use crate::vault::{BrokenLink, Vault};
 #[derive(Clone)]
 pub struct KnowledgeServer {
     vault: Arc<RwLock<Vault>>,
+    /// Cached knowledge graph, invalidated when vault is re-indexed.
+    graph_cache: Arc<RwLock<Option<KnowledgeGraph>>>,
     config: Config,
+    filter: SensitiveDataFilter,
     tool_router: ToolRouter<Self>,
 }
 
@@ -30,19 +39,120 @@ impl KnowledgeServer {
     /// Create a new knowledge server with the given configuration.
     pub fn new(config: Config) -> Self {
         let vault = Vault::new(&config.vault_path);
+        let filter = SensitiveDataFilter::new(config.sensitive_keywords.clone());
         Self {
             vault: Arc::new(RwLock::new(vault)),
+            graph_cache: Arc::new(RwLock::new(None)),
             config,
+            filter,
             tool_router: Self::tool_router(),
         }
     }
 
     /// Ensure the vault is indexed before operations.
+    /// Invalidates the graph cache if re-indexing occurs.
     async fn ensure_indexed(&self) -> Result<(), ErrorData> {
         let mut vault = self.vault.write().await;
+        let was_indexed = vault.is_indexed();
         vault
             .ensure_indexed()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        // Invalidate graph cache if we just indexed
+        if !was_indexed {
+            let mut graph_cache = self.graph_cache.write().await;
+            *graph_cache = None;
+        }
+        Ok(())
+    }
+
+    /// Get or build the knowledge graph from cache.
+    async fn get_graph(&self) -> Result<KnowledgeGraph, ErrorData> {
+        // Check if we have a cached graph
+        {
+            let cache = self.graph_cache.read().await;
+            if let Some(ref graph) = *cache {
+                return Ok(graph.clone());
+            }
+        }
+
+        // Build and cache the graph
+        let vault = self.vault.read().await;
+        let graph = KnowledgeGraph::from_vault(&vault);
+
+        let mut cache = self.graph_cache.write().await;
+        *cache = Some(graph.clone());
+
+        Ok(graph)
+    }
+
+    /// Check content for sensitive data and request user confirmation if needed.
+    /// Returns Ok(Ok(())) if content should be returned, Ok(Err(message)) if blocked.
+    async fn check_sensitive_content(
+        &self,
+        content: &str,
+        peer: &Peer<RoleServer>,
+    ) -> Result<Result<(), String>, ErrorData> {
+        let check = self.filter.check(content);
+        if !check.is_sensitive {
+            return Ok(Ok(()));
+        }
+
+        let keywords = check.matched_keywords.join(", ");
+
+        // Check if client supports elicitation
+        if peer.supports_elicitation() {
+            let message = format!(
+                "This content may contain sensitive data ({}).\nDo you want to proceed?",
+                keywords
+            );
+
+            // Build elicitation schema for a simple boolean confirmation
+            let schema = ElicitationSchema::builder()
+                .required_bool("confirm")
+                .build()
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+            let params = CreateElicitationRequestParam {
+                message,
+                requested_schema: schema,
+            };
+
+            match peer.create_elicitation(params).await {
+                Ok(result) => match result.action {
+                    ElicitationAction::Accept => {
+                        // Check if user confirmed
+                        if let Some(content) = result.content
+                            && let Some(confirmed) =
+                                content.get("confirm").and_then(|v| v.as_bool())
+                            && confirmed
+                        {
+                            return Ok(Ok(()));
+                        }
+                        Ok(Err(
+                            "Access to sensitive content was not confirmed.".to_string()
+                        ))
+                    }
+                    ElicitationAction::Decline => {
+                        Ok(Err("User declined to view sensitive content.".to_string()))
+                    }
+                    ElicitationAction::Cancel => Ok(Err("Request cancelled by user.".to_string())),
+                },
+                Err(e) => {
+                    tracing::warn!("Elicitation failed: {}", e);
+                    Ok(Err(format!(
+                        "Could not confirm access to sensitive content: {}",
+                        e
+                    )))
+                }
+            }
+        } else {
+            // Client doesn't support elicitation, block by default
+            Ok(Err(format!(
+                "This content may contain sensitive data ({}). Your client doesn't support confirmation dialogs. Access blocked.",
+                keywords
+            )))
+        }
     }
 }
 
@@ -161,7 +271,16 @@ impl KnowledgeServer {
     async fn search_notes(
         &self,
         Parameters(params): Parameters<SearchNotesParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Validate query is not empty
+        if params.query.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "Search query cannot be empty".to_string(),
+                None,
+            ));
+        }
+
         let options = SearchOptions {
             regex: params.regex,
             case_sensitive: params.case_sensitive,
@@ -175,6 +294,11 @@ impl KnowledgeServer {
         let json = serde_json::to_string_pretty(&results)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        // Check for sensitive content in search results
+        if let Err(message) = self.check_sensitive_content(&json, &peer).await? {
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -185,6 +309,7 @@ impl KnowledgeServer {
     async fn get_note(
         &self,
         Parameters(params): Parameters<GetNoteParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.ensure_indexed().await?;
 
@@ -218,6 +343,13 @@ impl KnowledgeServer {
         let json = serde_json::to_string_pretty(&info)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
+        // Check for sensitive content if content was included
+        if params.include_content
+            && let Err(message) = self.check_sensitive_content(&json, &peer).await?
+        {
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -227,6 +359,19 @@ impl KnowledgeServer {
         &self,
         Parameters(params): Parameters<ListNotesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Validate sort_by parameter
+        let valid_sort_options = ["name", "modified", "links"];
+        if !valid_sort_options.contains(&params.sort_by.as_str()) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "Invalid sort_by value '{}'. Must be one of: {}",
+                    params.sort_by,
+                    valid_sort_options.join(", ")
+                ),
+                None,
+            ));
+        }
+
         self.ensure_indexed().await?;
 
         let vault = self.vault.read().await;
@@ -289,9 +434,7 @@ impl KnowledgeServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.ensure_indexed().await?;
 
-        let vault = self.vault.read().await;
-        let graph = KnowledgeGraph::from_vault(&*vault);
-
+        let graph = self.get_graph().await?;
         let backlinks = graph.backlinks(&params.name);
 
         #[derive(Serialize)]
@@ -372,7 +515,7 @@ impl KnowledgeServer {
         self.ensure_indexed().await?;
 
         let vault = self.vault.read().await;
-        let graph = KnowledgeGraph::from_vault(&*vault);
+        let graph = self.get_graph().await?;
         let stats = graph.stats();
 
         let broken_links: Vec<BrokenLinkInfo> =

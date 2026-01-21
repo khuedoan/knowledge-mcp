@@ -1,3 +1,8 @@
+//! Data structures for representing notes and their metadata.
+//!
+//! This module defines the core types for notes, wiki links, and headings
+//! extracted from markdown files.
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;

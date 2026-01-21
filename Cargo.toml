@@ -1,11 +1,11 @@
 [package]
 name = "knowledge-mcp"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 # MCP Server
-rmcp = { version = "0.13", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "0.13", features = ["server", "transport-io", "macros", "elicitation"] }
 tokio = { version = "1", features = ["full"] }
 
 # Serialization
@@ -35,3 +35,5 @@ anyhow = "1"
 [dev-dependencies]
 tempfile = "3"
 anyhow = "1"
+# For integration tests - need client feature to create test clients
+rmcp = { version = "0.13", features = ["client", "server", "transport-io", "macros", "elicitation"] }

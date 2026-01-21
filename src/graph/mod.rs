@@ -1,13 +1,19 @@
+//! Knowledge graph operations for analyzing note connections.
+//!
+//! This module builds and analyzes a directed graph of note links
+//! using petgraph, providing backlink detection, hub identification,
+//! and orphan detection.
+
 use std::collections::HashMap;
 
-use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
+use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::vault::Vault;
 
 /// A knowledge graph built from vault links.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KnowledgeGraph {
     /// The directed graph of note connections.
     graph: DiGraph<String, ()>,
