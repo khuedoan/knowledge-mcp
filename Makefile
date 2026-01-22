@@ -5,3 +5,6 @@ dev:
 
 test:
 	cargo test
+
+fmt:
+	cargo fmt

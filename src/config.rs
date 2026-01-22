@@ -8,6 +8,16 @@ use std::path::PathBuf;
 /// Default keywords that indicate potentially sensitive content.
 const DEFAULT_SENSITIVE_KEYWORDS: &[&str] = &["salary"];
 
+/// Default content cache size (number of notes to cache).
+const DEFAULT_CACHE_SIZE: usize = 500;
+
+/// Default debounce duration for file watcher in milliseconds.
+const DEFAULT_WATCHER_DEBOUNCE_MS: u64 = 500;
+
+/// Default maximum content characters for embedding.
+/// 2000 chars (~400 words) provides good semantic context for embeddings.
+const DEFAULT_EMBEDDING_MAX_CHARS: usize = 2000;
+
 /// Trait for reading environment variables.
 ///
 /// This abstraction allows for dependency injection in tests,
@@ -41,6 +51,18 @@ pub struct Config {
     pub vault_path: PathBuf,
     /// Keywords that indicate potentially sensitive content.
     pub sensitive_keywords: Vec<String>,
+    /// Content cache size (number of notes to cache in memory).
+    pub cache_size: usize,
+    /// Whether to enable file system watching for live updates.
+    pub enable_watcher: bool,
+    /// Debounce duration for file watcher in milliseconds.
+    pub watcher_debounce_ms: u64,
+    /// Whether to enable semantic search with embeddings.
+    pub enable_embeddings: bool,
+    /// Maximum content characters to include in embeddings.
+    pub embedding_max_chars: usize,
+    /// Cache directory for embeddings and model files.
+    pub cache_dir: PathBuf,
 }
 
 impl Config {
@@ -79,21 +101,70 @@ impl Config {
                     .collect()
             });
 
+        let cache_size = reader
+            .get_var("KNOWLEDGE_CACHE_SIZE")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_CACHE_SIZE);
+
+        let enable_watcher = reader
+            .get_var("KNOWLEDGE_ENABLE_WATCHER")
+            .map(|s| s.to_lowercase() != "false" && s != "0")
+            .unwrap_or(true);
+
+        let watcher_debounce_ms = reader
+            .get_var("KNOWLEDGE_WATCHER_DEBOUNCE_MS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_WATCHER_DEBOUNCE_MS);
+
+        let enable_embeddings = reader
+            .get_var("KNOWLEDGE_ENABLE_EMBEDDINGS")
+            .map(|s| s.to_lowercase() != "false" && s != "0")
+            .unwrap_or(true);
+
+        let embedding_max_chars = reader
+            .get_var("KNOWLEDGE_EMBEDDING_MAX_CHARS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS);
+
+        let cache_dir = reader
+            .get_var("KNOWLEDGE_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::cache_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("knowledge-mcp")
+            });
+
         Self {
             vault_path,
             sensitive_keywords,
+            cache_size,
+            enable_watcher,
+            watcher_debounce_ms,
+            enable_embeddings,
+            embedding_max_chars,
+            cache_dir,
         }
     }
 
     /// Create a new configuration with a specific vault path.
     #[allow(dead_code)]
     pub fn with_path(vault_path: impl Into<PathBuf>) -> Self {
+        let vault_path = vault_path.into();
         Self {
-            vault_path: vault_path.into(),
+            vault_path,
             sensitive_keywords: DEFAULT_SENSITIVE_KEYWORDS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            cache_size: DEFAULT_CACHE_SIZE,
+            enable_watcher: true,
+            watcher_debounce_ms: DEFAULT_WATCHER_DEBOUNCE_MS,
+            enable_embeddings: true,
+            embedding_max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
+            cache_dir: dirs::cache_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("knowledge-mcp"),
         }
     }
 }
@@ -173,5 +244,47 @@ mod tests {
         let reader = MockEnvReader::new().with_var("KNOWLEDGE_SENSITIVE_KEYWORDS", "foo, , bar");
         let config = Config::from_env_reader(&reader);
         assert_eq!(config.sensitive_keywords, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn test_config_default_cache_settings() {
+        let config = Config::with_path("/tmp/vault");
+        assert_eq!(config.cache_size, DEFAULT_CACHE_SIZE);
+        assert!(config.enable_watcher);
+        assert_eq!(config.watcher_debounce_ms, DEFAULT_WATCHER_DEBOUNCE_MS);
+        assert!(config.enable_embeddings);
+        assert_eq!(config.embedding_max_chars, DEFAULT_EMBEDDING_MAX_CHARS);
+    }
+
+    #[test]
+    fn test_config_custom_cache_size() {
+        let reader = MockEnvReader::new().with_var("KNOWLEDGE_CACHE_SIZE", "1000");
+        let config = Config::from_env_reader(&reader);
+        assert_eq!(config.cache_size, 1000);
+    }
+
+    #[test]
+    fn test_config_disable_watcher() {
+        let reader = MockEnvReader::new().with_var("KNOWLEDGE_ENABLE_WATCHER", "false");
+        let config = Config::from_env_reader(&reader);
+        assert!(!config.enable_watcher);
+
+        let reader2 = MockEnvReader::new().with_var("KNOWLEDGE_ENABLE_WATCHER", "0");
+        let config2 = Config::from_env_reader(&reader2);
+        assert!(!config2.enable_watcher);
+    }
+
+    #[test]
+    fn test_config_disable_embeddings() {
+        let reader = MockEnvReader::new().with_var("KNOWLEDGE_ENABLE_EMBEDDINGS", "false");
+        let config = Config::from_env_reader(&reader);
+        assert!(!config.enable_embeddings);
+    }
+
+    #[test]
+    fn test_config_custom_cache_dir() {
+        let reader = MockEnvReader::new().with_var("KNOWLEDGE_CACHE_DIR", "/custom/cache");
+        let config = Config::from_env_reader(&reader);
+        assert_eq!(config.cache_dir, PathBuf::from("/custom/cache"));
     }
 }

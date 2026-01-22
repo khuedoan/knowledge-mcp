@@ -2,6 +2,10 @@
 //!
 //! This module provides the `Vault` struct which indexes all markdown files
 //! in a directory, extracting wiki links, headings, and metadata.
+//!
+//! Features:
+//! - Parallel indexing using rayon for fast initial load
+//! - Incremental updates for file changes (add/modify/remove)
 
 pub mod note;
 pub mod parser;
@@ -11,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use rayon::prelude::*;
 use thiserror::Error;
 use walkdir::WalkDir;
 
@@ -75,7 +80,7 @@ impl Vault {
         Ok(())
     }
 
-    /// Index all markdown files in the vault.
+    /// Index all markdown files in the vault using parallel processing.
     pub fn index(&mut self) -> Result<(), VaultError> {
         if !self.path.exists() {
             return Err(VaultError::PathNotFound(self.path.clone()));
@@ -83,23 +88,30 @@ impl Vault {
 
         self.notes.clear();
 
-        for entry in WalkDir::new(&self.path)
+        // Collect all markdown file paths
+        let paths: Vec<PathBuf> = WalkDir::new(&self.path)
             .follow_links(true)
             .into_iter()
             .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .map(|e| e.path().to_path_buf())
+            .collect();
 
-            // Only process markdown files
-            if path.extension().is_some_and(|ext| ext == "md") {
-                match self.parse_note(path) {
-                    Ok(note) => {
-                        let key = note.name.to_lowercase();
-                        self.notes.insert(key, note);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse note {:?}: {}", path, e);
-                    }
+        // Parse notes in parallel using rayon
+        let results: Vec<_> = paths
+            .par_iter()
+            .map(|path| Self::parse_note_static(path))
+            .collect();
+
+        // Insert results into HashMap (sequential, but fast)
+        for result in results {
+            match result {
+                Ok(note) => {
+                    let key = note.name.to_lowercase();
+                    self.notes.insert(key, note);
+                }
+                Err((path, e)) => {
+                    tracing::warn!("Failed to parse note {:?}: {}", path, e);
                 }
             }
         }
@@ -108,11 +120,77 @@ impl Vault {
         Ok(())
     }
 
-    /// Parse a single note file.
-    fn parse_note(&self, path: &Path) -> Result<Note, VaultError> {
-        let content = fs::read_to_string(path).map_err(|e| VaultError::ReadError {
-            path: path.to_path_buf(),
-            source: e,
+    /// Add or update a single note (for incremental updates).
+    ///
+    /// This is more efficient than re-indexing the entire vault when
+    /// only a single file has changed.
+    pub fn upsert_note(&mut self, path: &Path) -> Result<(), VaultError> {
+        if !path.exists() {
+            return Err(VaultError::PathNotFound(path.to_path_buf()));
+        }
+
+        // Only process markdown files
+        if !path.extension().is_some_and(|ext| ext == "md") {
+            return Ok(());
+        }
+
+        match Self::parse_note_static(path) {
+            Ok(note) => {
+                let key = note.name.to_lowercase();
+                self.notes.insert(key, note);
+                Ok(())
+            }
+            Err((_, e)) => Err(e),
+        }
+    }
+
+    /// Remove a note from the index by name.
+    ///
+    /// Used for incremental updates when a file is deleted.
+    pub fn remove_note(&mut self, name: &str) {
+        self.notes.remove(&name.to_lowercase());
+    }
+
+    /// Remove a note from the index by path.
+    ///
+    /// Used for incremental updates when a file is deleted.
+    pub fn remove_note_by_path(&mut self, path: &Path) {
+        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+            self.remove_note(name);
+        }
+    }
+
+    /// Check if a note needs re-indexing based on modification time.
+    pub fn note_needs_update(&self, path: &Path) -> bool {
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => return true,
+        };
+
+        match self.get_note(name) {
+            Some(note) => {
+                // Check if file modification time is newer
+                match fs::metadata(path).and_then(|m| m.modified()) {
+                    Ok(mtime) => mtime > note.modified,
+                    Err(_) => true, // Re-index if we can't get metadata
+                }
+            }
+            None => true, // Note doesn't exist, needs indexing
+        }
+    }
+
+    /// Parse a single note file (static version for parallel processing).
+    ///
+    /// Returns the parsed note or an error tuple with the path for logging.
+    fn parse_note_static(path: &Path) -> Result<Note, (PathBuf, VaultError)> {
+        let content = fs::read_to_string(path).map_err(|e| {
+            (
+                path.to_path_buf(),
+                VaultError::ReadError {
+                    path: path.to_path_buf(),
+                    source: e,
+                },
+            )
         })?;
 
         let name = path
@@ -366,5 +444,60 @@ mod tests {
         assert!(names.contains(&"Note B"));
         assert!(names.contains(&"Note C"));
         assert!(names.contains(&"Orphan"));
+    }
+
+    #[test]
+    fn test_vault_upsert_note() {
+        let (dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+        assert_eq!(vault.note_count(), 4);
+
+        // Add a new note
+        let new_path = dir.path().join("New Note.md");
+        let mut file = File::create(&new_path).unwrap();
+        file.write_all(b"# New Note\n\nThis is a new note.")
+            .unwrap();
+
+        vault.upsert_note(&new_path).unwrap();
+        assert_eq!(vault.note_count(), 5);
+        assert!(vault.get_note("New Note").is_some());
+    }
+
+    #[test]
+    fn test_vault_remove_note() {
+        let (_dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+        assert_eq!(vault.note_count(), 4);
+
+        vault.remove_note("Note A");
+        assert_eq!(vault.note_count(), 3);
+        assert!(vault.get_note("Note A").is_none());
+    }
+
+    #[test]
+    fn test_vault_remove_note_by_path() {
+        let (dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+        assert_eq!(vault.note_count(), 4);
+
+        let path = dir.path().join("Note A.md");
+        vault.remove_note_by_path(&path);
+        assert_eq!(vault.note_count(), 3);
+        assert!(vault.get_note("Note A").is_none());
+    }
+
+    #[test]
+    fn test_vault_note_needs_update() {
+        let (dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+
+        let path = dir.path().join("Note A.md");
+
+        // Note was just indexed, shouldn't need update
+        assert!(!vault.note_needs_update(&path));
+
+        // Non-existent note should need update
+        let new_path = dir.path().join("New Note.md");
+        assert!(vault.note_needs_update(&new_path));
     }
 }

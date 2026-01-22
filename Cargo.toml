@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = "1"
 
 # Markdown parsing with wiki-link support
 pulldown-cmark = "0.13"
@@ -31,6 +32,25 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+
+# File system watching
+notify = "7"
+notify-debouncer-mini = "0.5"
+
+# Content caching
+lru = "0.12"
+
+# Embeddings (local, no external runtime)
+fastembed = "4"
+
+# Parallel processing
+rayon = "1.10"
+
+# Content hashing for embedding invalidation
+seahash = "4"
+
+# System directories
+dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"

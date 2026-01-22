@@ -17,9 +17,36 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration from environment
     let config = Config::from_env();
     tracing::info!("Vault path: {:?}", config.vault_path);
+    tracing::info!(
+        "Features: watcher={}, embeddings={}",
+        config.enable_watcher,
+        config.enable_embeddings
+    );
 
     // Create the server
-    let server = KnowledgeServer::new(config);
+    let server = KnowledgeServer::new(config.clone());
+
+    // Initialize the server (index vault, setup embeddings)
+    tracing::info!("Initializing server...");
+    if let Err(e) = server.initialize().await {
+        tracing::error!("Failed to initialize server: {}", e);
+        // Continue anyway - basic functionality will still work
+    }
+
+    // Start file watcher if enabled
+    if config.enable_watcher {
+        match server.start_watcher() {
+            Ok(_) => {
+                // The watcher task runs in the background until the process exits.
+                // We intentionally don't store the handle - the task will be
+                // cancelled automatically when the runtime shuts down.
+                tracing::info!("File watcher started");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start file watcher: {}", e);
+            }
+        }
+    }
 
     // Run the server over stdio
     let service = server.serve(stdio()).await?;
