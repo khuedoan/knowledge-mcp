@@ -17,6 +17,7 @@ pub mod filter;
 pub mod graph;
 pub mod search;
 pub mod tools;
+pub mod validation;
 pub mod vault;
 pub mod watcher;
 

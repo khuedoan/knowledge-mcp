@@ -35,6 +35,29 @@ pub enum VaultError {
         source: std::io::Error,
     },
 
+    #[error("Failed to write file: {path}")]
+    WriteError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to delete file: {path}")]
+    DeleteError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Invalid note name: {0}")]
+    InvalidNoteName(String),
+
+    #[error("Note already exists: {0}")]
+    NoteAlreadyExists(String),
+
+    #[error("Note not found: {0}")]
+    NoteNotFound(String),
+
     #[error("Failed to walk directory: {0}")]
     WalkError(#[from] walkdir::Error),
 }
@@ -246,12 +269,151 @@ impl Vault {
     pub fn read_note_content(&self, name: &str) -> Result<String, VaultError> {
         let note = self
             .get_note(name)
-            .ok_or_else(|| VaultError::PathNotFound(PathBuf::from(name)))?;
+            .ok_or_else(|| VaultError::NoteNotFound(name.to_string()))?;
 
         fs::read_to_string(&note.path).map_err(|e| VaultError::ReadError {
             path: note.path.clone(),
             source: e,
         })
+    }
+
+    // =========================================================================
+    // Write Operations
+    // =========================================================================
+
+    /// Validate a note name for safety and convention.
+    ///
+    /// Rules:
+    /// - Must not be empty
+    /// - Must not contain path separators (/, \)
+    /// - Must not contain invalid filename characters (:, *, ?, <, >, |)
+    /// - Must not start with a dot (hidden files)
+    /// - Must be reasonable length (1-200 chars)
+    pub fn validate_note_name(name: &str) -> Result<(), VaultError> {
+        let name = name.trim();
+
+        if name.is_empty() {
+            return Err(VaultError::InvalidNoteName(
+                "Note name cannot be empty".to_string(),
+            ));
+        }
+
+        if name.len() > 200 {
+            return Err(VaultError::InvalidNoteName(
+                "Note name must be 200 characters or less".to_string(),
+            ));
+        }
+
+        if name.starts_with('.') {
+            return Err(VaultError::InvalidNoteName(
+                "Note name cannot start with a dot".to_string(),
+            ));
+        }
+
+        // Check for path traversal and invalid characters
+        let invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+        for c in invalid_chars {
+            if name.contains(c) {
+                return Err(VaultError::InvalidNoteName(format!(
+                    "Note name cannot contain '{}'",
+                    c
+                )));
+            }
+        }
+
+        // Check for path traversal patterns
+        if name.contains("..") {
+            return Err(VaultError::InvalidNoteName(
+                "Note name cannot contain '..'".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Get the file path for a note (doesn't check if it exists).
+    pub fn note_path(&self, name: &str) -> PathBuf {
+        self.path.join(format!("{}.md", name))
+    }
+
+    /// Write a new note to the vault.
+    ///
+    /// Returns the path to the created file.
+    /// Fails if a note with this name already exists.
+    pub fn write_note(&mut self, name: &str, content: &str) -> Result<PathBuf, VaultError> {
+        Self::validate_note_name(name)?;
+
+        let path = self.note_path(name);
+
+        if path.exists() {
+            return Err(VaultError::NoteAlreadyExists(name.to_string()));
+        }
+
+        fs::write(&path, content).map_err(|e| VaultError::WriteError {
+            path: path.clone(),
+            source: e,
+        })?;
+
+        // Update the index
+        self.upsert_note(&path)?;
+
+        Ok(path)
+    }
+
+    /// Overwrite an existing note with new content.
+    ///
+    /// Returns the path to the updated file.
+    /// Fails if the note doesn't exist.
+    pub fn overwrite_note(&mut self, name: &str, content: &str) -> Result<PathBuf, VaultError> {
+        Self::validate_note_name(name)?;
+
+        let path = self.note_path(name);
+
+        if !path.exists() {
+            return Err(VaultError::NoteNotFound(name.to_string()));
+        }
+
+        fs::write(&path, content).map_err(|e| VaultError::WriteError {
+            path: path.clone(),
+            source: e,
+        })?;
+
+        // Update the index
+        self.upsert_note(&path)?;
+
+        Ok(path)
+    }
+
+    /// Delete a note from the vault.
+    ///
+    /// Removes both the file and the index entry.
+    /// Fails if the note doesn't exist.
+    pub fn delete_note_file(&mut self, name: &str) -> Result<(), VaultError> {
+        Self::validate_note_name(name)?;
+
+        let path = self.note_path(name);
+
+        if !path.exists() {
+            return Err(VaultError::NoteNotFound(name.to_string()));
+        }
+
+        fs::remove_file(&path).map_err(|e| VaultError::DeleteError {
+            path: path.clone(),
+            source: e,
+        })?;
+
+        // Remove from index
+        self.remove_note(name);
+
+        Ok(())
+    }
+
+    /// Read the AGENTS.md guidelines file from the vault root.
+    ///
+    /// Returns None if the file doesn't exist.
+    pub fn read_guidelines(&self) -> Option<String> {
+        let path = self.path.join("AGENTS.md");
+        fs::read_to_string(&path).ok()
     }
 
     /// Get backlinks to a note (notes that link to it).
@@ -499,5 +661,142 @@ mod tests {
         // Non-existent note should need update
         let new_path = dir.path().join("New Note.md");
         assert!(vault.note_needs_update(&new_path));
+    }
+
+    // =========================================================================
+    // Write Operation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_note_name_valid() {
+        assert!(Vault::validate_note_name("Simple Note").is_ok());
+        assert!(Vault::validate_note_name("Note-With-Dashes").is_ok());
+        assert!(Vault::validate_note_name("Note_With_Underscores").is_ok());
+        assert!(Vault::validate_note_name("Note 123").is_ok());
+        assert!(Vault::validate_note_name("日本語ノート").is_ok()); // Unicode
+    }
+
+    #[test]
+    fn test_validate_note_name_invalid() {
+        // Empty
+        assert!(Vault::validate_note_name("").is_err());
+        assert!(Vault::validate_note_name("   ").is_err());
+
+        // Path traversal
+        assert!(Vault::validate_note_name("../etc/passwd").is_err());
+        assert!(Vault::validate_note_name("foo/bar").is_err());
+        assert!(Vault::validate_note_name("foo\\bar").is_err());
+        assert!(Vault::validate_note_name("..").is_err());
+
+        // Invalid characters
+        assert!(Vault::validate_note_name("Note:Invalid").is_err());
+        assert!(Vault::validate_note_name("Note*Invalid").is_err());
+        assert!(Vault::validate_note_name("Note?Invalid").is_err());
+        assert!(Vault::validate_note_name("Note<Invalid").is_err());
+        assert!(Vault::validate_note_name("Note>Invalid").is_err());
+        assert!(Vault::validate_note_name("Note|Invalid").is_err());
+
+        // Hidden files
+        assert!(Vault::validate_note_name(".hidden").is_err());
+
+        // Too long
+        let long_name = "a".repeat(201);
+        assert!(Vault::validate_note_name(&long_name).is_err());
+    }
+
+    #[test]
+    fn test_vault_write_note() {
+        let (_dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+        assert_eq!(vault.note_count(), 4);
+
+        let path = vault
+            .write_note("New Note", "# New Note\n\nContent here.")
+            .unwrap();
+
+        assert!(path.exists());
+        assert_eq!(vault.note_count(), 5);
+        assert!(vault.get_note("New Note").is_some());
+
+        let content = vault.read_note_content("New Note").unwrap();
+        assert!(content.contains("# New Note"));
+    }
+
+    #[test]
+    fn test_vault_write_note_already_exists() {
+        let (_dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+
+        let result = vault.write_note("Note A", "# Note A\n\nNew content.");
+        assert!(matches!(result, Err(VaultError::NoteAlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_vault_overwrite_note() {
+        let (_dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+
+        let original = vault.read_note_content("Note A").unwrap();
+        assert!(original.contains("[[Note B]]"));
+
+        vault
+            .overwrite_note("Note A", "# Note A\n\nCompletely new content.")
+            .unwrap();
+
+        let updated = vault.read_note_content("Note A").unwrap();
+        assert!(updated.contains("Completely new content"));
+        assert!(!updated.contains("[[Note B]]"));
+    }
+
+    #[test]
+    fn test_vault_overwrite_note_not_found() {
+        let (_dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+
+        let result = vault.overwrite_note("Does Not Exist", "# New\n\nContent.");
+        assert!(matches!(result, Err(VaultError::NoteNotFound(_))));
+    }
+
+    #[test]
+    fn test_vault_delete_note_file() {
+        let (_dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+        assert_eq!(vault.note_count(), 4);
+
+        let path = vault.note_path("Note A");
+        assert!(path.exists());
+
+        vault.delete_note_file("Note A").unwrap();
+
+        assert!(!path.exists());
+        assert_eq!(vault.note_count(), 3);
+        assert!(vault.get_note("Note A").is_none());
+    }
+
+    #[test]
+    fn test_vault_delete_note_not_found() {
+        let (_dir, mut vault) = create_test_vault();
+        vault.index().unwrap();
+
+        let result = vault.delete_note_file("Does Not Exist");
+        assert!(matches!(result, Err(VaultError::NoteNotFound(_))));
+    }
+
+    #[test]
+    fn test_vault_read_guidelines() {
+        let (dir, vault) = create_test_vault();
+
+        // No guidelines file initially
+        assert!(vault.read_guidelines().is_none());
+
+        // Create AGENTS.md
+        let guidelines_path = dir.path().join("AGENTS.md");
+        let mut file = File::create(&guidelines_path).unwrap();
+        file.write_all(b"# Writing Guidelines\n\nFollow these rules.")
+            .unwrap();
+
+        // Now it should be readable
+        let guidelines = vault.read_guidelines().unwrap();
+        assert!(guidelines.contains("Writing Guidelines"));
     }
 }

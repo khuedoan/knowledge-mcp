@@ -1,7 +1,7 @@
 # Knowledge MCP
 
-MCP server to allow agents to learn from my personal knowledge management
-system.
+MCP server to allow agents to learn from and contribute to my personal knowledge
+management system (see [./examples](./examples/)).
 
 > **DISCLAIMER:** I basically vibe coded this MCP server. I provided the agent
 > direction, architecture choices, libraries to use, feedback when using the
@@ -13,11 +13,14 @@ system.
 - **Knowledge Graph** - Builds a graph of note connections (links, backlinks)
 - **Content Search** - Regex-based search across all notes
 - **Semantic Search** - Natural language search using local embeddings (BGE-small)
+- **Knowledge Ingestion** - Create, update, and delete notes with content validation
 - **Live Updates** - File system watching for automatic re-indexing
 - **Content Caching** - LRU cache with modification time tracking
 - **Sensitive Data Filtering** - Configurable keyword-based content filtering
 
 ## MCP Tools
+
+### Read Tools
 
 | Tool | Description |
 |------|-------------|
@@ -29,6 +32,50 @@ system.
 | `get_backlinks` | Get all notes linking to a specific note |
 | `get_links` | Get all outgoing links from a note |
 | `get_graph_stats` | Get knowledge graph statistics |
+
+### Write Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_writing_guidelines` | Get vault's AGENTS.md conventions (must call before writing) |
+| `create_note` | Create a new atomic note |
+| `update_note` | Update an existing note (replace or append) |
+| `delete_note` | Delete a note (requires confirmation) |
+
+## MCP Resources
+
+| Resource URI | Description |
+|--------------|-------------|
+| `vault://guidelines` | Writing guidelines from AGENTS.md |
+
+## Writing Guidelines (AGENTS.md)
+
+To enable write operations, create an `AGENTS.md` file in your vault root with your writing conventions. The agent must call `get_writing_guidelines` before creating, updating, or deleting notes.
+
+Example `AGENTS.md`:
+
+```markdown
+# Writing Guidelines
+
+## Zettelkasten Principles
+
+1. **Atomicity**: One idea per note
+2. **Self-contained**: Understandable on its own
+3. **Connectivity**: Link to related notes with [[Wiki Links]]
+
+## Note Structure
+
+- Use H1 for the title (matching the note name)
+- Use [[wiki links]] for connections to other notes
+- Add a ## References section for citing sources
+
+## Reference Format
+
+- [Source Title](URL) - Accessed YYYY-MM-DD
+  - *Optional insight about the source*
+```
+
+The server validates note content and returns warnings (not errors) if conventions aren't followed, helping guide the agent toward better note structure.
 
 ## Configuration
 

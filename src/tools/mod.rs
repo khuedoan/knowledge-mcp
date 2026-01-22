@@ -14,6 +14,7 @@ use rmcp::{
     ServerHandler,
     handler::server::{tool::ToolCallContext, tool::ToolRouter, wrapper::Parameters},
     model::*,
+    model::{Annotated, RawResource},
     schemars, // Import the crate so derive macro can find it
     service::{Peer, RequestContext, RoleServer},
     tool,
@@ -29,7 +30,8 @@ use crate::embedding::{EmbeddingConfig, EmbeddingIndex, vault_id_from_path};
 use crate::filter::SensitiveDataFilter;
 use crate::graph::KnowledgeGraph;
 use crate::search::{self, SearchOptions};
-use crate::vault::{BrokenLink, Vault};
+use crate::validation::{self, ValidationResult};
+use crate::vault::{BrokenLink, Vault, VaultError};
 use crate::watcher::{FileWatcher, VaultChange};
 
 /// The knowledge vault MCP server handler.
@@ -45,6 +47,9 @@ pub struct KnowledgeServer {
     /// File watcher for live updates (if enabled).
     #[allow(dead_code)]
     watcher: Option<Arc<FileWatcher>>,
+    /// Whether the writing guidelines have been acknowledged this session.
+    /// Must be true before create_note, update_note, or delete_note can be called.
+    guidelines_acknowledged: Arc<RwLock<bool>>,
     config: Config,
     filter: SensitiveDataFilter,
     tool_router: ToolRouter<Self>,
@@ -63,6 +68,7 @@ impl KnowledgeServer {
             content_cache: Arc::new(RwLock::new(content_cache)),
             embedding_index: Arc::new(RwLock::new(None)),
             watcher: None,
+            guidelines_acknowledged: Arc::new(RwLock::new(false)),
             config,
             filter,
             tool_router: Self::tool_router(),
@@ -360,6 +366,56 @@ impl KnowledgeServer {
             )))
         }
     }
+
+    /// Require that guidelines have been acknowledged before write operations.
+    ///
+    /// Returns an error if `get_writing_guidelines` hasn't been called this session.
+    async fn require_guidelines(&self) -> Result<(), ErrorData> {
+        let acknowledged = *self.guidelines_acknowledged.read().await;
+        if !acknowledged {
+            return Err(ErrorData::invalid_request(
+                "You must call get_writing_guidelines before creating, updating, or deleting notes. \
+                 This vault follows specific Zettelkasten conventions that must be understood first."
+                    .to_string(),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Update embeddings for a newly created or modified note.
+    async fn update_note_embedding(&self, name: &str, content: &str) {
+        if !self.config.enable_embeddings {
+            return;
+        }
+
+        let vault = self.vault.read().await;
+        let note = match vault.get_note(name) {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        drop(vault);
+
+        let mut index = self.embedding_index.write().await;
+        if let Some(ref mut idx) = *index {
+            let result = tokio::task::block_in_place(|| idx.embed_note(&note, content));
+            if let Err(e) = result {
+                tracing::warn!("Failed to embed note '{}': {}", name, e);
+            }
+        }
+    }
+
+    /// Remove embeddings for a deleted note.
+    async fn remove_note_embedding(&self, name: &str) {
+        if !self.config.enable_embeddings {
+            return;
+        }
+
+        let mut index = self.embedding_index.write().await;
+        if let Some(ref mut idx) = *index {
+            idx.remove(name);
+        }
+    }
 }
 
 // ============================================================================
@@ -510,6 +566,103 @@ impl From<BrokenLink> for BrokenLinkInfo {
             target: bl.target,
         }
     }
+}
+
+// ============================================================================
+// Write Tool Input/Output Types
+// ============================================================================
+
+/// Response for the get_writing_guidelines tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GuidelinesResponse {
+    /// The content of the AGENTS.md guidelines file.
+    pub guidelines: String,
+    /// Where the guidelines were loaded from.
+    pub source: String,
+    /// Current number of notes in the vault.
+    pub note_count: usize,
+    /// Confirmation message.
+    pub message: String,
+}
+
+/// Parameters for the create_note tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(title = "CreateNoteParams")]
+pub struct CreateNoteParams {
+    /// Note name (will be used as filename without .md extension).
+    /// Should be a clear, descriptive title in Title Case.
+    pub name: String,
+    /// The full markdown content of the note.
+    /// Should follow Zettelkasten principles: atomic, self-contained, with [[wiki-links]].
+    pub content: String,
+}
+
+/// Response for the create_note tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CreateNoteResponse {
+    /// Whether the note was created successfully.
+    pub success: bool,
+    /// The name of the created note.
+    pub name: String,
+    /// The file path of the created note.
+    pub path: String,
+    /// Validation results with any warnings.
+    pub validation: ValidationResult,
+    /// Status message.
+    pub message: String,
+}
+
+/// Parameters for the update_note tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(title = "UpdateNoteParams")]
+pub struct UpdateNoteParams {
+    /// The name of the note to update (without .md extension).
+    pub name: String,
+    /// New content to replace the entire note. Mutually exclusive with `append`.
+    pub content: Option<String>,
+    /// Content to append to the end of the note. Mutually exclusive with `content`.
+    pub append: Option<String>,
+}
+
+/// Response for the update_note tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct UpdateNoteResponse {
+    /// Whether the note was updated successfully.
+    pub success: bool,
+    /// The name of the updated note.
+    pub name: String,
+    /// The file path of the updated note.
+    pub path: String,
+    /// Validation results with any warnings.
+    pub validation: ValidationResult,
+    /// Status message.
+    pub message: String,
+}
+
+/// Parameters for the delete_note tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(title = "DeleteNoteParams")]
+pub struct DeleteNoteParams {
+    /// The name of the note to delete (without .md extension).
+    pub name: String,
+    /// Must be set to true to confirm deletion. This prevents accidental deletions.
+    pub confirm: bool,
+}
+
+/// Response for the delete_note tool.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeleteNoteResponse {
+    /// Whether the note was deleted successfully.
+    pub success: bool,
+    /// The name of the deleted note.
+    pub name: String,
+    /// Notes that now have broken links due to this deletion.
+    pub backlinks_broken: Vec<String>,
+    /// Status message.
+    pub message: String,
 }
 
 // ============================================================================
@@ -924,6 +1077,311 @@ impl KnowledgeServer {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    // ========================================================================
+    // Write Tools
+    // ========================================================================
+
+    /// Get the writing guidelines for this vault.
+    #[tool(description = "Get the writing guidelines for this knowledge vault.
+
+IMPORTANT: You MUST call this tool before creating, updating, or deleting notes.
+
+This vault follows the Zettelkasten method for knowledge management. The guidelines 
+document (AGENTS.md) explains:
+- Note structure and formatting conventions
+- How to create atomic, self-contained notes
+- Wiki-link syntax for connecting ideas
+- Reference/citation format for sources
+
+After calling this tool, you will be able to use create_note, update_note, and delete_note.")]
+    async fn get_writing_guidelines(&self) -> Result<CallToolResult, ErrorData> {
+        self.ensure_indexed().await?;
+
+        let vault = self.vault.read().await;
+
+        let guidelines = vault.read_guidelines().unwrap_or_else(|| {
+            "No AGENTS.md file found in vault root.\n\n\
+             Please create an AGENTS.md file with your writing conventions.\n\n\
+             Recommended sections:\n\
+             - Note structure (title, headings, content)\n\
+             - Zettelkasten principles (atomicity, connectivity)\n\
+             - Wiki-link conventions\n\
+             - Reference format for citing sources"
+                .to_string()
+        });
+
+        let note_count = vault.notes().count();
+        drop(vault);
+
+        // Mark guidelines as acknowledged for this session
+        *self.guidelines_acknowledged.write().await = true;
+
+        let response = GuidelinesResponse {
+            guidelines,
+            source: "AGENTS.md".to_string(),
+            note_count,
+            message: "Guidelines acknowledged. You may now create, update, or delete notes."
+                .to_string(),
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Create a new atomic note in the vault.
+    #[tool(description = "Create a new atomic note in the knowledge vault.
+
+PREREQUISITES:
+- You must call get_writing_guidelines first (enforced)
+
+ZETTELKASTEN PRINCIPLES:
+- Atomicity: One idea per note
+- Self-contained: Understandable on its own
+- Connected: Link to related notes with [[Wiki Links]]
+- Clear title: Use the note name as H1 heading
+
+STRUCTURE:
+```
+# Note Title
+
+Brief definition or core concept (1-2 sentences).
+
+## Main Content
+
+Detailed explanation with [[links]] to related concepts.
+
+## See Also
+
+- [[Related Note 1]]
+- [[Related Note 2]]
+
+## References
+
+- [Source Title](URL) - Accessed YYYY-MM-DD
+```
+
+Returns validation warnings if conventions aren't followed (note is still created).")]
+    async fn create_note(
+        &self,
+        Parameters(params): Parameters<CreateNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Require guidelines to be acknowledged
+        self.require_guidelines().await?;
+        self.ensure_indexed().await?;
+
+        // Validate content (warnings only, doesn't block)
+        let validation = validation::validate_note_content(&params.name, &params.content);
+
+        // Write the note
+        let mut vault = self.vault.write().await;
+        let path = vault
+            .write_note(&params.name, &params.content)
+            .map_err(|e| match e {
+                VaultError::NoteAlreadyExists(n) => ErrorData::invalid_params(
+                    format!("Note '{}' already exists. Use update_note to modify it.", n),
+                    None,
+                ),
+                VaultError::InvalidNoteName(msg) => ErrorData::invalid_params(msg, None),
+                e => ErrorData::internal_error(e.to_string(), None),
+            })?;
+
+        // Invalidate graph cache since we added a note
+        *self.graph_cache.write().await = None;
+
+        // Update embeddings
+        drop(vault);
+        self.update_note_embedding(&params.name, &params.content)
+            .await;
+
+        let response = CreateNoteResponse {
+            success: true,
+            name: params.name,
+            path: path.to_string_lossy().to_string(),
+            validation,
+            message: "Note created successfully".to_string(),
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Update an existing note in the vault.
+    #[tool(description = "Update an existing note in the knowledge vault.
+
+PREREQUISITES:
+- You must call get_writing_guidelines first (enforced)
+- Note must already exist
+
+MODES:
+- content: Replace the entire note content
+- append: Add content to the end of the note (useful for adding references or new sections)
+
+Only one of 'content' or 'append' should be provided, not both.")]
+    async fn update_note(
+        &self,
+        Parameters(params): Parameters<UpdateNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Require guidelines to be acknowledged
+        self.require_guidelines().await?;
+        self.ensure_indexed().await?;
+
+        // Validate parameters
+        if params.content.is_none() && params.append.is_none() {
+            return Err(ErrorData::invalid_params(
+                "Either 'content' or 'append' must be provided".to_string(),
+                None,
+            ));
+        }
+        if params.content.is_some() && params.append.is_some() {
+            return Err(ErrorData::invalid_params(
+                "Only one of 'content' or 'append' should be provided, not both".to_string(),
+                None,
+            ));
+        }
+
+        let mut vault = self.vault.write().await;
+
+        // Get current content if appending
+        let new_content = if let Some(append) = params.append {
+            let current = vault.read_note_content(&params.name).map_err(|e| match e {
+                VaultError::NoteNotFound(n) => ErrorData::invalid_params(
+                    format!("Note '{}' not found. Use create_note to create it.", n),
+                    None,
+                ),
+                e => ErrorData::internal_error(e.to_string(), None),
+            })?;
+            format!("{}\n\n{}", current.trim_end(), append)
+        } else {
+            params.content.unwrap()
+        };
+
+        // Validate the new content
+        let validation = validation::validate_note_content(&params.name, &new_content);
+
+        // Overwrite the note
+        let path = vault
+            .overwrite_note(&params.name, &new_content)
+            .map_err(|e| match e {
+                VaultError::NoteNotFound(n) => ErrorData::invalid_params(
+                    format!("Note '{}' not found. Use create_note to create it.", n),
+                    None,
+                ),
+                VaultError::InvalidNoteName(msg) => ErrorData::invalid_params(msg, None),
+                e => ErrorData::internal_error(e.to_string(), None),
+            })?;
+
+        // Invalidate caches
+        *self.graph_cache.write().await = None;
+        {
+            let mut cache = self.content_cache.write().await;
+            cache.invalidate(&params.name);
+        }
+
+        // Update embeddings
+        drop(vault);
+        self.update_note_embedding(&params.name, &new_content).await;
+
+        let response = UpdateNoteResponse {
+            success: true,
+            name: params.name,
+            path: path.to_string_lossy().to_string(),
+            validation,
+            message: "Note updated successfully".to_string(),
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Delete a note from the vault.
+    #[tool(description = "Delete a note from the knowledge vault.
+
+PREREQUISITES:
+- You must call get_writing_guidelines first (enforced)
+- Note must exist
+- confirm must be set to true
+
+WARNING: This is a destructive operation that cannot be undone.
+Any notes linking to this note will have broken links after deletion.
+The response includes which notes had backlinks to the deleted note.")]
+    async fn delete_note(
+        &self,
+        Parameters(params): Parameters<DeleteNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Require guidelines to be acknowledged
+        self.require_guidelines().await?;
+        self.ensure_indexed().await?;
+
+        // Require explicit confirmation
+        if !params.confirm {
+            return Err(ErrorData::invalid_params(
+                "Deletion not confirmed. Set 'confirm: true' to delete the note. \
+                 This is a destructive operation that cannot be undone."
+                    .to_string(),
+                None,
+            ));
+        }
+
+        // Get backlinks before deletion (to report which links will break)
+        let backlinks_broken = {
+            let vault = self.vault.read().await;
+            vault
+                .backlinks(&params.name)
+                .iter()
+                .map(|n| n.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Delete the note
+        let mut vault = self.vault.write().await;
+        vault.delete_note_file(&params.name).map_err(|e| match e {
+            VaultError::NoteNotFound(n) => {
+                ErrorData::invalid_params(format!("Note '{}' not found", n), None)
+            }
+            VaultError::InvalidNoteName(msg) => ErrorData::invalid_params(msg, None),
+            e => ErrorData::internal_error(e.to_string(), None),
+        })?;
+
+        // Invalidate caches
+        *self.graph_cache.write().await = None;
+        {
+            let mut cache = self.content_cache.write().await;
+            cache.invalidate(&params.name);
+        }
+
+        // Remove embeddings
+        drop(vault);
+        self.remove_note_embedding(&params.name).await;
+
+        let message = if backlinks_broken.is_empty() {
+            "Note deleted successfully".to_string()
+        } else {
+            format!(
+                "Note deleted. Warning: {} note(s) now have broken links to this note: {}",
+                backlinks_broken.len(),
+                backlinks_broken.join(", ")
+            )
+        };
+
+        let response = DeleteNoteResponse {
+            success: true,
+            name: params.name,
+            backlinks_broken,
+            message,
+        };
+
+        let json = serde_json::to_string_pretty(&response)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 // ============================================================================
@@ -937,6 +1395,10 @@ impl ServerHandler for KnowledgeServer {
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(false),
+                }),
+                resources: Some(ResourcesCapability {
+                    list_changed: Some(false),
+                    subscribe: Some(false),
                 }),
                 ..Default::default()
             },
@@ -970,5 +1432,68 @@ impl ServerHandler for KnowledgeServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let ctx = ToolCallContext::new(self, request, context);
         self.tool_router.call(ctx).await
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, rmcp::ErrorData> {
+        let mut resources = Vec::new();
+
+        // Check if AGENTS.md exists and add it as a resource
+        let vault = self.vault.read().await;
+        if vault.read_guidelines().is_some() {
+            let raw = RawResource {
+                uri: "vault://guidelines".into(),
+                name: "Writing Guidelines".into(),
+                title: Some("Writing Guidelines".into()),
+                description: Some(
+                    "Zettelkasten writing conventions for this vault (AGENTS.md)".into(),
+                ),
+                mime_type: Some("text/markdown".into()),
+                size: None,
+                icons: None,
+                meta: None,
+            };
+            resources.push(Annotated::new(raw, None));
+        }
+
+        Ok(ListResourcesResult {
+            resources,
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+        match request.uri.as_str() {
+            "vault://guidelines" => {
+                let vault = self.vault.read().await;
+                let content = vault.read_guidelines().ok_or_else(|| {
+                    ErrorData::resource_not_found(
+                        "AGENTS.md not found in vault. Create this file with your writing guidelines.",
+                        None,
+                    )
+                })?;
+
+                Ok(ReadResourceResult {
+                    contents: vec![ResourceContents::TextResourceContents {
+                        uri: request.uri,
+                        mime_type: Some("text/markdown".into()),
+                        text: content,
+                        meta: None,
+                    }],
+                })
+            }
+            _ => Err(ErrorData::resource_not_found(
+                format!("Unknown resource: {}", request.uri),
+                None,
+            )),
+        }
     }
 }
