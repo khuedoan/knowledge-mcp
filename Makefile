@@ -1,4 +1,7 @@
-default: dev
+default: build
+
+build:
+	cargo build --release
 
 dev:
 	cargo run
@@ -8,3 +11,7 @@ test:
 
 fmt:
 	cargo fmt
+
+install: build
+	# TODO make Nix flake
+	cp target/release/knowledge-mcp ~/.local/bin/knowledge-mcp
