@@ -71,8 +71,6 @@ pub struct Config {
     pub enable_watcher: bool,
     /// Debounce duration for file watcher in milliseconds.
     pub watcher_debounce_ms: u64,
-    /// Whether to enable semantic search with embeddings.
-    pub enable_embeddings: bool,
     /// Maximum content characters to include in embeddings.
     pub embedding_max_chars: usize,
     /// Cache directory for embeddings and model files.
@@ -130,11 +128,6 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_WATCHER_DEBOUNCE_MS);
 
-        let enable_embeddings = reader
-            .get_var("KNOWLEDGE_ENABLE_EMBEDDINGS")
-            .map(|s| s.to_lowercase() != "false" && s != "0")
-            .unwrap_or(true);
-
         let embedding_max_chars = reader
             .get_var("KNOWLEDGE_EMBEDDING_MAX_CHARS")
             .and_then(|s| s.parse().ok())
@@ -155,7 +148,6 @@ impl Config {
             cache_size,
             enable_watcher,
             watcher_debounce_ms,
-            enable_embeddings,
             embedding_max_chars,
             cache_dir,
         }
@@ -174,7 +166,6 @@ impl Config {
             cache_size: DEFAULT_CACHE_SIZE,
             enable_watcher: true,
             watcher_debounce_ms: DEFAULT_WATCHER_DEBOUNCE_MS,
-            enable_embeddings: true,
             embedding_max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
             cache_dir: dirs::cache_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -266,7 +257,6 @@ mod tests {
         assert_eq!(config.cache_size, DEFAULT_CACHE_SIZE);
         assert!(config.enable_watcher);
         assert_eq!(config.watcher_debounce_ms, DEFAULT_WATCHER_DEBOUNCE_MS);
-        assert!(config.enable_embeddings);
         assert_eq!(config.embedding_max_chars, DEFAULT_EMBEDDING_MAX_CHARS);
     }
 
@@ -286,13 +276,6 @@ mod tests {
         let reader2 = MockEnvReader::new().with_var("KNOWLEDGE_ENABLE_WATCHER", "0");
         let config2 = Config::from_env_reader(&reader2);
         assert!(!config2.enable_watcher);
-    }
-
-    #[test]
-    fn test_config_disable_embeddings() {
-        let reader = MockEnvReader::new().with_var("KNOWLEDGE_ENABLE_EMBEDDINGS", "false");
-        let config = Config::from_env_reader(&reader);
-        assert!(!config.enable_embeddings);
     }
 
     #[test]

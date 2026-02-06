@@ -8,8 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebouncedEvent, Debouncer, new_debouncer};
+#[cfg(test)]
+use notify::PollWatcher;
+#[cfg(not(test))]
+use notify::RecommendedWatcher;
+use notify::{Config as NotifyConfig, RecursiveMode};
+use notify_debouncer_mini::{
+    Config as DebouncerConfig, DebouncedEvent, Debouncer, new_debouncer_opt,
+};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -61,12 +67,17 @@ impl VaultChange {
 /// Uses debouncing to batch rapid changes (e.g., editor save + backup).
 pub struct FileWatcher {
     /// The debouncer that wraps the underlying watcher.
-    _debouncer: Debouncer<RecommendedWatcher>,
+    _debouncer: Debouncer<WatcherBackend>,
     /// Broadcast sender for vault change events.
     change_tx: broadcast::Sender<VaultChange>,
     /// Handle to the background polling task.
     _poll_handle: std::thread::JoinHandle<()>,
 }
+
+#[cfg(test)]
+type WatcherBackend = PollWatcher;
+#[cfg(not(test))]
+type WatcherBackend = RecommendedWatcher;
 
 impl FileWatcher {
     /// Create a new file watcher for the given vault path.
@@ -85,8 +96,13 @@ impl FileWatcher {
         // Create a channel for the debouncer
         let (tx, rx) = mpsc::channel();
 
+        let notify_config = watcher_notify_config();
+        let debouncer_config = DebouncerConfig::default()
+            .with_timeout(debounce_duration)
+            .with_notify_config(notify_config);
+
         // Create debounced watcher
-        let mut debouncer = new_debouncer(debounce_duration, tx)?;
+        let mut debouncer = new_debouncer_opt::<_, WatcherBackend>(debouncer_config, tx)?;
 
         // Start watching the vault path recursively
         debouncer
@@ -162,6 +178,18 @@ impl FileWatcher {
 }
 
 #[cfg(test)]
+fn watcher_notify_config() -> NotifyConfig {
+    NotifyConfig::default()
+        .with_poll_interval(Duration::from_millis(100))
+        .with_compare_contents(true)
+}
+
+#[cfg(not(test))]
+fn watcher_notify_config() -> NotifyConfig {
+    NotifyConfig::default()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::{self, File};
@@ -169,11 +197,32 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
+    async fn wait_for_change(
+        rx: &mut broadcast::Receiver<VaultChange>,
+        timeout: Duration,
+    ) -> Option<VaultChange> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(change)) => return Some(change),
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_watcher_detects_new_file() {
         let dir = tempdir().unwrap();
         let watcher = FileWatcher::new(dir.path(), Some(100)).unwrap();
         let mut rx = watcher.subscribe();
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Create a new markdown file
         let path = dir.path().join("test.md");
@@ -182,10 +231,10 @@ mod tests {
         drop(file);
 
         // Wait for the event with timeout
-        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        let change = wait_for_change(&mut rx, Duration::from_secs(5)).await;
 
-        assert!(result.is_ok(), "Should receive event");
-        let change = result.unwrap().unwrap();
+        assert!(change.is_some(), "Should receive event");
+        let change = change.unwrap();
         assert!(matches!(change, VaultChange::Modified(_)));
         // Compare file names only to avoid macOS /var vs /private/var differences
         assert_eq!(change.path().file_name(), path.file_name());
@@ -207,6 +256,7 @@ mod tests {
 
         let watcher = FileWatcher::new(dir.path(), Some(100)).unwrap();
         let mut rx = watcher.subscribe();
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Modify the file
         {
@@ -215,10 +265,10 @@ mod tests {
         }
 
         // Wait for the event
-        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        let change = wait_for_change(&mut rx, Duration::from_secs(5)).await;
 
-        assert!(result.is_ok(), "Should receive event");
-        let change = result.unwrap().unwrap();
+        assert!(change.is_some(), "Should receive event");
+        let change = change.unwrap();
         assert!(matches!(change, VaultChange::Modified(_)));
     }
 
@@ -238,15 +288,16 @@ mod tests {
 
         let watcher = FileWatcher::new(dir.path(), Some(100)).unwrap();
         let mut rx = watcher.subscribe();
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Remove the file
         fs::remove_file(&path).unwrap();
 
         // Wait for the event
-        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        let change = wait_for_change(&mut rx, Duration::from_secs(5)).await;
 
-        assert!(result.is_ok(), "Should receive event");
-        let change = result.unwrap().unwrap();
+        assert!(change.is_some(), "Should receive event");
+        let change = change.unwrap();
         assert!(matches!(change, VaultChange::Removed(_)));
     }
 

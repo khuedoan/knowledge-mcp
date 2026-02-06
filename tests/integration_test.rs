@@ -61,55 +61,11 @@ async fn test_list_tools_returns_expected_tools() -> Result<()> {
 
     let tool_names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
 
-    assert!(tool_names.contains(&"list_notes"));
     assert!(tool_names.contains(&"get_note"));
     assert!(tool_names.contains(&"search_notes"));
     assert!(tool_names.contains(&"get_backlinks"));
     assert!(tool_names.contains(&"get_links"));
     assert!(tool_names.contains(&"get_graph_stats"));
-
-    client.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_list_notes_returns_all_example_notes() -> Result<()> {
-    let (server_transport, client_transport) = tokio::io::duplex(8192);
-
-    let config = Config::with_path(examples_path());
-    let server = KnowledgeServer::new(config);
-
-    tokio::spawn(async move {
-        let server_handle = server.serve(server_transport).await.unwrap();
-        server_handle.waiting().await.ok();
-    });
-
-    let client = TestClientHandler::new().serve(client_transport).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    let result = client
-        .call_tool(CallToolRequestParam {
-            name: "list_notes".into(),
-            arguments: None,
-            task: None,
-        })
-        .await?;
-
-    let json = parse_json_result(&result)?;
-    let notes = json.as_array().expect("Expected array of notes");
-
-    // Should have 13 example notes
-    assert_eq!(notes.len(), 13);
-
-    // Check some expected note names
-    let note_names: Vec<&str> = notes
-        .iter()
-        .filter_map(|n| n.get("name").and_then(|v| v.as_str()))
-        .collect();
-
-    assert!(note_names.contains(&"Zettelkasten Method"));
-    assert!(note_names.contains(&"Deep Work"));
-    assert!(note_names.contains(&"Knowledge Graph"));
 
     client.cancel().await?;
     Ok(())

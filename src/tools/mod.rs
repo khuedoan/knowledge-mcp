@@ -21,7 +21,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::cache::ContentCache;
 use crate::config::Config;
@@ -42,6 +42,8 @@ pub struct KnowledgeServer {
     content_cache: Arc<RwLock<ContentCache>>,
     /// Embedding index for semantic search.
     embedding_index: Arc<RwLock<Option<EmbeddingIndex>>>,
+    /// Guards embedding initialization to avoid duplicate work.
+    embedding_init_lock: Arc<Mutex<()>>,
     /// File watcher for live updates (if enabled).
     #[allow(dead_code)]
     watcher: Option<Arc<FileWatcher>>,
@@ -62,6 +64,7 @@ impl KnowledgeServer {
             graph_cache: Arc::new(RwLock::new(None)),
             content_cache: Arc::new(RwLock::new(content_cache)),
             embedding_index: Arc::new(RwLock::new(None)),
+            embedding_init_lock: Arc::new(Mutex::new(())),
             watcher: None,
             config,
             filter,
@@ -73,18 +76,6 @@ impl KnowledgeServer {
     ///
     /// This should be called after creating the server but before serving requests.
     pub async fn initialize(&self) -> Result<(), String> {
-        // Index the vault
-        self.ensure_indexed()
-            .await
-            .map_err(|e| format!("Failed to index vault: {}", e.message))?;
-
-        // Initialize embeddings if enabled
-        if self.config.enable_embeddings {
-            self.initialize_embeddings()
-                .await
-                .map_err(|e| format!("Failed to initialize embeddings: {}", e))?;
-        }
-
         Ok(())
     }
 
@@ -143,6 +134,25 @@ impl KnowledgeServer {
         Ok(())
     }
 
+    async fn ensure_embeddings_initialized(&self) -> Result<(), ErrorData> {
+        self.ensure_indexed().await?;
+
+        if self.embedding_index.read().await.is_some() {
+            return Ok(());
+        }
+
+        let _guard = self.embedding_init_lock.lock().await;
+        if self.embedding_index.read().await.is_some() {
+            return Ok(());
+        }
+
+        self.initialize_embeddings()
+            .await
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+
+        Ok(())
+    }
+
     /// Start the file watcher for live updates.
     ///
     /// Returns a handle that can be used to stop the watcher.
@@ -162,8 +172,6 @@ impl KnowledgeServer {
         let graph_cache = Arc::clone(&self.graph_cache);
         let content_cache = Arc::clone(&self.content_cache);
         let embedding_index = Arc::clone(&self.embedding_index);
-        let config = self.config.clone();
-
         let handle = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -192,25 +200,22 @@ impl KnowledgeServer {
                                     cache.invalidate(name);
                                 }
 
-                                // Re-embed if embeddings are enabled
-                                if config.enable_embeddings {
-                                    if let Some(note) = note_clone {
-                                        let content = {
-                                            let mut cache = content_cache.write().await;
-                                            cache.get_or_read(&note.name, path).ok()
-                                        };
+                                if let Some(note) = note_clone {
+                                    let content = {
+                                        let mut cache = content_cache.write().await;
+                                        cache.get_or_read(&note.name, path).ok()
+                                    };
 
-                                        if let Some(content) = content {
-                                            let mut index = embedding_index.write().await;
-                                            if let Some(ref mut idx) = *index {
-                                                // Use block_in_place to avoid blocking the async
-                                                // runtime during ML inference
-                                                let result = tokio::task::block_in_place(|| {
-                                                    idx.embed_note(&note, &content)
-                                                });
-                                                if let Err(e) = result {
-                                                    tracing::warn!("Failed to embed note: {}", e);
-                                                }
+                                    if let Some(content) = content {
+                                        let mut index = embedding_index.write().await;
+                                        if let Some(ref mut idx) = *index {
+                                            // Use block_in_place to avoid blocking the async
+                                            // runtime during ML inference
+                                            let result = tokio::task::block_in_place(|| {
+                                                idx.embed_note(&note, &content)
+                                            });
+                                            if let Err(e) = result {
+                                                tracing::warn!("Failed to embed note: {}", e);
                                             }
                                         }
                                     }
@@ -227,11 +232,9 @@ impl KnowledgeServer {
                                     cache.invalidate(name);
 
                                     // Remove embedding
-                                    if config.enable_embeddings {
-                                        let mut index = embedding_index.write().await;
-                                        if let Some(ref mut idx) = *index {
-                                            idx.remove(name);
-                                        }
+                                    let mut index = embedding_index.write().await;
+                                    if let Some(ref mut idx) = *index {
+                                        idx.remove(name);
                                     }
                                 }
                             }
@@ -395,20 +398,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Parameters for the list_notes tool.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListNotesParams {
-    /// Sort order: "name", "modified", or "links" (default: "name").
-    #[serde(default = "default_sort")]
-    pub sort_by: String,
-    /// Maximum number of notes to return.
-    pub limit: Option<usize>,
-}
-
-fn default_sort() -> String {
-    "name".to_string()
-}
-
 /// Parameters for the get_backlinks tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetBacklinksParams {
@@ -519,7 +508,9 @@ impl From<BrokenLink> for BrokenLinkInfo {
 #[tool_router]
 impl KnowledgeServer {
     /// Search for notes containing the given query.
-    #[tool(description = "Search for notes containing the given text or regex pattern")]
+    #[tool(
+        description = "Search the user's personal knowledge vault for exact text or regex. Use when the user asks about their notes, preferences, projects, or anything that might be in their vault."
+    )]
     async fn search_notes(
         &self,
         Parameters(params): Parameters<SearchNotesParams>,
@@ -556,7 +547,7 @@ impl KnowledgeServer {
 
     /// Get detailed information about a specific note.
     #[tool(
-        description = "Get detailed information about a specific note, including its content, links, and metadata"
+        description = "Get detailed information about a specific note, including its content, links, and metadata. Use after you know the note name (e.g., from search or semantic_search)."
     )]
     async fn get_note(
         &self,
@@ -605,81 +596,10 @@ impl KnowledgeServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    /// List all notes in the vault.
-    #[tool(description = "List all notes in the vault with basic information")]
-    async fn list_notes(
-        &self,
-        Parameters(params): Parameters<ListNotesParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        // Validate sort_by parameter
-        let valid_sort_options = ["name", "modified", "links"];
-        if !valid_sort_options.contains(&params.sort_by.as_str()) {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "Invalid sort_by value '{}'. Must be one of: {}",
-                    params.sort_by,
-                    valid_sort_options.join(", ")
-                ),
-                None,
-            ));
-        }
-
-        self.ensure_indexed().await?;
-
-        let vault = self.vault.read().await;
-
-        let mut notes: Vec<_> = vault
-            .notes()
-            .map(|n| {
-                let backlinks = vault.backlinks(&n.name).len();
-                (
-                    n.name.clone(),
-                    n.title.clone(),
-                    n.links.len(),
-                    backlinks,
-                    n.modified,
-                )
-            })
-            .collect();
-
-        // Sort based on sort_by parameter
-        match params.sort_by.as_str() {
-            "modified" => notes.sort_by(|a, b| b.4.cmp(&a.4)),
-            "links" => notes.sort_by(|a, b| (b.2 + b.3).cmp(&(a.2 + a.3))),
-            _ => notes.sort_by(|a, b| a.0.cmp(&b.0)), // "name" or default
-        }
-
-        // Apply limit
-        if let Some(limit) = params.limit {
-            notes.truncate(limit);
-        }
-
-        #[derive(Serialize)]
-        struct NoteListItem {
-            name: String,
-            title: Option<String>,
-            outgoing_links: usize,
-            backlinks: usize,
-        }
-
-        let items: Vec<_> = notes
-            .into_iter()
-            .map(|(name, title, links, backlinks, _)| NoteListItem {
-                name,
-                title,
-                outgoing_links: links,
-                backlinks,
-            })
-            .collect();
-
-        let json = serde_json::to_string_pretty(&items)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
     /// Get notes that link to the specified note.
-    #[tool(description = "Get all notes that link to the specified note (backlinks)")]
+    #[tool(
+        description = "Get all notes that link to the specified note (backlinks). Use to navigate related topics."
+    )]
     async fn get_backlinks(
         &self,
         Parameters(params): Parameters<GetBacklinksParams>,
@@ -709,7 +629,9 @@ impl KnowledgeServer {
     }
 
     /// Get outgoing links from a note.
-    #[tool(description = "Get all outgoing links from the specified note")]
+    #[tool(
+        description = "Get all outgoing links from the specified note. Use to explore related topics in the vault."
+    )]
     async fn get_links(
         &self,
         Parameters(params): Parameters<GetLinksParams>,
@@ -761,7 +683,7 @@ impl KnowledgeServer {
 
     /// Get statistics about the knowledge graph.
     #[tool(
-        description = "Get statistics about the knowledge graph including orphan notes, hub notes, and broken links"
+        description = "Get statistics about the knowledge graph including orphan notes, hub notes, and broken links. Use for meta questions about the vault."
     )]
     async fn get_graph_stats(&self) -> Result<CallToolResult, ErrorData> {
         self.ensure_indexed().await?;
@@ -797,20 +719,13 @@ impl KnowledgeServer {
 
     /// Semantic search for notes by meaning.
     #[tool(
-        description = "Search notes by meaning using natural language (semantic search). Requires embeddings to be enabled."
+        description = "Search the user's personal knowledge vault by meaning (semantic search). Use by default for research/coding/debugging queries that likely relate to the user's notes."
     )]
     async fn semantic_search(
         &self,
         Parameters(params): Parameters<SemanticSearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Check if embeddings are enabled
-        if !self.config.enable_embeddings {
-            return Err(ErrorData::invalid_params(
-                "Semantic search is disabled. Set KNOWLEDGE_ENABLE_EMBEDDINGS=true to enable."
-                    .to_string(),
-                None,
-            ));
-        }
+        self.ensure_embeddings_initialized().await?;
 
         // Validate query is not empty
         if params.query.trim().is_empty() {
@@ -822,11 +737,7 @@ impl KnowledgeServer {
 
         let embedding_index = self.embedding_index.read().await;
         let index = embedding_index.as_ref().ok_or_else(|| {
-            ErrorData::internal_error(
-                "Embedding index not initialized. Please wait for initialization to complete."
-                    .to_string(),
-                None,
-            )
+            ErrorData::internal_error("Embedding index not initialized.".to_string(), None)
         })?;
 
         // Perform semantic search
@@ -862,29 +773,20 @@ impl KnowledgeServer {
     }
 
     /// Find notes similar to a given note.
-    #[tool(description = "Find notes that are semantically similar to a given note")]
+    #[tool(
+        description = "Find notes that are semantically similar to a given note. Use to surface related notes once you have a starting note name."
+    )]
     async fn find_similar_notes(
         &self,
         Parameters(params): Parameters<FindSimilarParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Check if embeddings are enabled
-        if !self.config.enable_embeddings {
-            return Err(ErrorData::invalid_params(
-                "Semantic search is disabled. Set KNOWLEDGE_ENABLE_EMBEDDINGS=true to enable."
-                    .to_string(),
-                None,
-            ));
-        }
+        self.ensure_embeddings_initialized().await?;
 
         self.ensure_indexed().await?;
 
         let embedding_index = self.embedding_index.read().await;
         let index = embedding_index.as_ref().ok_or_else(|| {
-            ErrorData::internal_error(
-                "Embedding index not initialized. Please wait for initialization to complete."
-                    .to_string(),
-                None,
-            )
+            ErrorData::internal_error("Embedding index not initialized.".to_string(), None)
         })?;
 
         // Find similar notes
@@ -933,7 +835,7 @@ impl KnowledgeServer {
 impl ServerHandler for KnowledgeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            protocol_version: Default::default(),
+            protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities {
                 tools: Some(ToolsCapability {
                     list_changed: Some(false),

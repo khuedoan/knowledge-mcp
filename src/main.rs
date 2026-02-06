@@ -18,9 +18,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env();
     tracing::info!("Vault path: {:?}", config.vault_path);
     tracing::info!(
-        "Features: watcher={}, embeddings={}",
-        config.enable_watcher,
-        config.enable_embeddings
+        "Features: watcher={}, embeddings=enabled",
+        config.enable_watcher
     );
 
     // Create the server

@@ -63,7 +63,6 @@ Environment variables:
 |----------|---------|-------------|
 | `KNOWLEDGE_VAULT_PATH` | (required) | Path to your markdown vault |
 | `KNOWLEDGE_SENSITIVE_KEYWORDS` | `salary` | Comma-separated keywords to filter |
-| `KNOWLEDGE_ENABLE_EMBEDDINGS` | `true` | Enable semantic search |
 | `KNOWLEDGE_ENABLE_WATCHER` | `true` | Enable live file watching |
 | `KNOWLEDGE_CACHE_SIZE` | `500` | Number of notes to cache in memory |
 | `KNOWLEDGE_CACHE_DIR` | System cache dir | Directory for embeddings cache |
@@ -72,7 +71,6 @@ Environment variables:
 
 | Tool | Description |
 |------|-------------|
-| `list_notes` | List all notes with basic info |
 | `get_note` | Get note content, links, and metadata |
 | `search_notes` | Search notes by text or regex pattern |
 | `semantic_search` | Search notes by meaning (natural language) |
