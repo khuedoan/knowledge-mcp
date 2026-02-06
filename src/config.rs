@@ -5,6 +5,20 @@
 
 use std::path::PathBuf;
 
+/// Expand tilde (~) in paths to the user's home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&path[2..]);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
+}
+
 /// Default keywords that indicate potentially sensitive content.
 const DEFAULT_SENSITIVE_KEYWORDS: &[&str] = &["salary"];
 
@@ -83,7 +97,7 @@ impl Config {
     pub fn from_env_reader(reader: &impl EnvReader) -> Self {
         let vault_path = reader
             .get_var("KNOWLEDGE_VAULT_PATH")
-            .map(PathBuf::from)
+            .map(|s| expand_tilde(&s))
             .unwrap_or_else(|| reader.current_dir().unwrap_or_else(|| PathBuf::from(".")));
 
         let sensitive_keywords = reader
@@ -128,7 +142,7 @@ impl Config {
 
         let cache_dir = reader
             .get_var("KNOWLEDGE_CACHE_DIR")
-            .map(PathBuf::from)
+            .map(|s| expand_tilde(&s))
             .unwrap_or_else(|| {
                 dirs::cache_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -286,5 +300,47 @@ mod tests {
         let reader = MockEnvReader::new().with_var("KNOWLEDGE_CACHE_DIR", "/custom/cache");
         let config = Config::from_env_reader(&reader);
         assert_eq!(config.cache_dir, PathBuf::from("/custom/cache"));
+    }
+
+    #[test]
+    fn test_expand_tilde_with_path() {
+        let expanded = expand_tilde("~/Documents/notes");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expanded, home.join("Documents/notes"));
+    }
+
+    #[test]
+    fn test_expand_tilde_only() {
+        let expanded = expand_tilde("~");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expanded, home);
+    }
+
+    #[test]
+    fn test_expand_tilde_absolute_path() {
+        let expanded = expand_tilde("/absolute/path");
+        assert_eq!(expanded, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_expand_tilde_relative_path() {
+        let expanded = expand_tilde("relative/path");
+        assert_eq!(expanded, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_config_vault_path_tilde_expansion() {
+        let reader = MockEnvReader::new().with_var("KNOWLEDGE_VAULT_PATH", "~/Documents/notes");
+        let config = Config::from_env_reader(&reader);
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(config.vault_path, home.join("Documents/notes"));
+    }
+
+    #[test]
+    fn test_config_cache_dir_tilde_expansion() {
+        let reader = MockEnvReader::new().with_var("KNOWLEDGE_CACHE_DIR", "~/.cache/knowledge");
+        let config = Config::from_env_reader(&reader);
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(config.cache_dir, home.join(".cache/knowledge"));
     }
 }

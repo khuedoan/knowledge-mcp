@@ -98,8 +98,8 @@ async fn test_list_notes_returns_all_example_notes() -> Result<()> {
     let json = parse_json_result(&result)?;
     let notes = json.as_array().expect("Expected array of notes");
 
-    // Should have 14 example notes (including AGENTS.md)
-    assert_eq!(notes.len(), 14);
+    // Should have 13 example notes
+    assert_eq!(notes.len(), 13);
 
     // Check some expected note names
     let note_names: Vec<&str> = notes
@@ -378,7 +378,7 @@ async fn test_graph_stats() -> Result<()> {
 
     let json = parse_json_result(&result)?;
 
-    assert_eq!(json.get("total_notes").and_then(|v| v.as_u64()), Some(14));
+    assert_eq!(json.get("total_notes").and_then(|v| v.as_u64()), Some(13));
     assert!(
         json.get("total_links")
             .and_then(|v| v.as_u64())
