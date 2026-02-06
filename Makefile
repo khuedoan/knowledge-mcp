@@ -12,6 +12,6 @@ test:
 fmt:
 	cargo fmt
 
-install: build
+install:
 	# TODO make Nix flake
-	cp target/release/knowledge-mcp ~/.local/bin/knowledge-mcp
+	cargo install --path .
