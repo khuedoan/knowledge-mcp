@@ -106,6 +106,10 @@ async fn test_get_note_returns_content() -> Result<()> {
     assert!(content.contains("Zettelkasten"));
     assert!(content.contains("[[Deep Work]]")); // Should contain wiki-style links
 
+    // Verify links and backlinks are present
+    assert!(json.get("links").and_then(|v| v.as_array()).is_some());
+    assert!(json.get("backlinks").and_then(|v| v.as_array()).is_some());
+
     client.cancel().await?;
     Ok(())
 }
@@ -137,6 +141,10 @@ async fn test_get_note_without_content() -> Result<()> {
 
     assert_eq!(json.get("name").and_then(|v| v.as_str()), Some("Deep Work"));
     assert!(json.get("content").and_then(|v| v.as_str()).is_none());
+
+    // Links and backlinks should still be present even without content
+    assert!(json.get("links").and_then(|v| v.as_array()).is_some());
+    assert!(json.get("backlinks").and_then(|v| v.as_array()).is_some());
 
     client.cancel().await?;
     Ok(())

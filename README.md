@@ -71,7 +71,7 @@ Environment variables:
 
 | Tool | Description |
 |------|-------------|
-| `get_note` | Get note content, links, and metadata |
+| `get_note` | Get note content, outgoing links, and backlinks |
 | `search_notes` | Search notes by text or regex pattern |
 | `semantic_search` | Search notes by meaning (natural language) |
 | `find_similar_notes` | Find notes similar to a given note |

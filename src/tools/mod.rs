@@ -464,8 +464,8 @@ pub struct NoteInfo {
     pub name: String,
     pub title: Option<String>,
     pub path: String,
-    pub link_count: usize,
-    pub backlink_count: usize,
+    pub links: Vec<String>,
+    pub backlinks: Vec<String>,
     pub content: Option<String>,
 }
 
@@ -547,7 +547,7 @@ impl KnowledgeServer {
 
     /// Get detailed information about a specific note.
     #[tool(
-        description = "Get detailed information about a specific note, including its content, links, and metadata. Use after you know the note name (e.g., from search or semantic_search)."
+        description = "Get detailed information about a specific note, including its content, outgoing links, and backlinks. The response includes lists of all linked note names for easy navigation. Use after you know the note name (e.g., from search or semantic_search). After reading a note, consider following its outgoing links or backlinks using get_links/get_backlinks if they could provide useful additional context."
     )]
     async fn get_note(
         &self,
@@ -562,7 +562,19 @@ impl KnowledgeServer {
             ErrorData::invalid_params(format!("Note not found: {}", params.name), None)
         })?;
 
-        let backlink_count = vault.backlinks(&params.name).len();
+        let backlinks_notes = vault.backlinks(&params.name);
+
+        let links: Vec<String> = note
+            .links
+            .iter()
+            .filter(|l| !l.target.is_empty()) // Skip same-file links
+            .map(|l| l.target.clone())
+            .collect();
+
+        let backlinks: Vec<String> = backlinks_notes
+            .into_iter()
+            .map(|n| n.name.clone())
+            .collect();
 
         let content = if params.include_content {
             Some(
@@ -578,8 +590,8 @@ impl KnowledgeServer {
             name: note.name.clone(),
             title: note.title.clone(),
             path: note.path.to_string_lossy().to_string(),
-            link_count: note.links.len(),
-            backlink_count,
+            links,
+            backlinks,
             content,
         };
 
