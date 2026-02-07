@@ -89,11 +89,11 @@ pub struct EmbeddingIndex {
 }
 
 impl EmbeddingIndex {
-    /// Create a new embedding index with the default model (BGE-small-en-v1.5).
+    /// Create a new embedding index with the default model (BGE-base-en-v1.5).
     ///
-    /// This will download the model on first use (~33MB).
+    /// This will download the model on first use (~90MB).
     pub fn new(config: EmbeddingConfig) -> Result<Self, EmbeddingError> {
-        Self::with_model(EmbeddingModel::BGESmallENV15, config)
+        Self::with_model(EmbeddingModel::BGEBaseENV15, config)
     }
 
     /// Create a new embedding index with a specific model.
