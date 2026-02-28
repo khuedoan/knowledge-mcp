@@ -29,8 +29,16 @@ const DEFAULT_CACHE_SIZE: usize = 500;
 const DEFAULT_WATCHER_DEBOUNCE_MS: u64 = 500;
 
 /// Default maximum content characters for embedding.
-/// 2000 chars (~400 words) provides good semantic context for embeddings.
-const DEFAULT_EMBEDDING_MAX_CHARS: usize = 2000;
+/// 1800 chars keeps chunks well under 512 tokens with headings/prefixes.
+const DEFAULT_EMBEDDING_MAX_CHARS: usize = 1800;
+/// Default overlap between embedding chunks (in characters).
+const DEFAULT_EMBEDDING_CHUNK_OVERLAP_CHARS: usize = 200;
+/// Default maximum characters for link-context embedding text.
+const DEFAULT_EMBEDDING_LINK_CONTEXT_MAX_CHARS: usize = 320;
+/// Default weight for link-context embeddings.
+const DEFAULT_EMBEDDING_LINK_CONTEXT_WEIGHT: f32 = 0.7;
+/// Default flag to include link-context embeddings.
+const DEFAULT_EMBEDDING_INCLUDE_LINK_CONTEXT: bool = true;
 
 /// Trait for reading environment variables.
 ///
@@ -73,6 +81,14 @@ pub struct Config {
     pub watcher_debounce_ms: u64,
     /// Maximum content characters to include in embeddings.
     pub embedding_max_chars: usize,
+    /// Overlap between embedding chunks in characters.
+    pub embedding_chunk_overlap_chars: usize,
+    /// Maximum characters for link-context embedding text.
+    pub embedding_link_context_max_chars: usize,
+    /// Weight for link-context embeddings.
+    pub embedding_link_context_weight: f32,
+    /// Whether to include link-context embeddings.
+    pub embedding_include_link_context: bool,
     /// Cache directory for embeddings and model files.
     pub cache_dir: PathBuf,
 }
@@ -133,6 +149,26 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS);
 
+        let embedding_chunk_overlap_chars = reader
+            .get_var("KNOWLEDGE_EMBEDDING_CHUNK_OVERLAP_CHARS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_EMBEDDING_CHUNK_OVERLAP_CHARS);
+
+        let embedding_link_context_max_chars = reader
+            .get_var("KNOWLEDGE_EMBEDDING_LINK_CONTEXT_MAX_CHARS")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_EMBEDDING_LINK_CONTEXT_MAX_CHARS);
+
+        let embedding_link_context_weight = reader
+            .get_var("KNOWLEDGE_EMBEDDING_LINK_CONTEXT_WEIGHT")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_EMBEDDING_LINK_CONTEXT_WEIGHT);
+
+        let embedding_include_link_context = reader
+            .get_var("KNOWLEDGE_EMBEDDING_INCLUDE_LINK_CONTEXT")
+            .map(|s| s.to_lowercase() != "false" && s != "0")
+            .unwrap_or(DEFAULT_EMBEDDING_INCLUDE_LINK_CONTEXT);
+
         let cache_dir = reader
             .get_var("KNOWLEDGE_CACHE_DIR")
             .map(|s| expand_tilde(&s))
@@ -149,6 +185,10 @@ impl Config {
             enable_watcher,
             watcher_debounce_ms,
             embedding_max_chars,
+            embedding_chunk_overlap_chars,
+            embedding_link_context_max_chars,
+            embedding_link_context_weight,
+            embedding_include_link_context,
             cache_dir,
         }
     }
@@ -167,6 +207,10 @@ impl Config {
             enable_watcher: true,
             watcher_debounce_ms: DEFAULT_WATCHER_DEBOUNCE_MS,
             embedding_max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
+            embedding_chunk_overlap_chars: DEFAULT_EMBEDDING_CHUNK_OVERLAP_CHARS,
+            embedding_link_context_max_chars: DEFAULT_EMBEDDING_LINK_CONTEXT_MAX_CHARS,
+            embedding_link_context_weight: DEFAULT_EMBEDDING_LINK_CONTEXT_WEIGHT,
+            embedding_include_link_context: DEFAULT_EMBEDDING_INCLUDE_LINK_CONTEXT,
             cache_dir: dirs::cache_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("knowledge-mcp"),
@@ -258,6 +302,39 @@ mod tests {
         assert!(config.enable_watcher);
         assert_eq!(config.watcher_debounce_ms, DEFAULT_WATCHER_DEBOUNCE_MS);
         assert_eq!(config.embedding_max_chars, DEFAULT_EMBEDDING_MAX_CHARS);
+        assert_eq!(
+            config.embedding_chunk_overlap_chars,
+            DEFAULT_EMBEDDING_CHUNK_OVERLAP_CHARS
+        );
+        assert_eq!(
+            config.embedding_link_context_max_chars,
+            DEFAULT_EMBEDDING_LINK_CONTEXT_MAX_CHARS
+        );
+        assert!(
+            (config.embedding_link_context_weight - DEFAULT_EMBEDDING_LINK_CONTEXT_WEIGHT).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(
+            config.embedding_include_link_context,
+            DEFAULT_EMBEDDING_INCLUDE_LINK_CONTEXT
+        );
+    }
+
+    #[test]
+    fn test_config_custom_embedding_settings() {
+        let reader = MockEnvReader::new()
+            .with_var("KNOWLEDGE_EMBEDDING_MAX_CHARS", "1500")
+            .with_var("KNOWLEDGE_EMBEDDING_CHUNK_OVERLAP_CHARS", "120")
+            .with_var("KNOWLEDGE_EMBEDDING_LINK_CONTEXT_MAX_CHARS", "300")
+            .with_var("KNOWLEDGE_EMBEDDING_LINK_CONTEXT_WEIGHT", "0.75")
+            .with_var("KNOWLEDGE_EMBEDDING_INCLUDE_LINK_CONTEXT", "false");
+
+        let config = Config::from_env_reader(&reader);
+        assert_eq!(config.embedding_max_chars, 1500);
+        assert_eq!(config.embedding_chunk_overlap_chars, 120);
+        assert_eq!(config.embedding_link_context_max_chars, 300);
+        assert!((config.embedding_link_context_weight - 0.75).abs() < 0.0001);
+        assert!(!config.embedding_include_link_context);
     }
 
     #[test]

@@ -12,7 +12,7 @@ system. An example knowledge vault is available at [`./examples`](./examples/).
 - Vault Indexing: parses markdown files with wiki-style `[[links]]`
 - Knowledge Graph: builds a graph of note connections (links, backlinks)
 - Content Search: regex-based search across all notes
-- Semantic Search: natural language search using local embeddings
+- Semantic Search: chunked local embeddings with link context and graph expansion
 - Live Updates: file system watching for automatic re-indexing
 - Sensitive Data Filtering: configurable keyword-based content filtering
 - Content Caching: LRU cache with modification time tracking
@@ -66,6 +66,11 @@ Environment variables:
 | `KNOWLEDGE_ENABLE_WATCHER` | `true` | Enable live file watching |
 | `KNOWLEDGE_CACHE_SIZE` | `500` | Number of notes to cache in memory |
 | `KNOWLEDGE_CACHE_DIR` | System cache dir | Directory for embeddings cache |
+| `KNOWLEDGE_EMBEDDING_MAX_CHARS` | `1800` | Max characters per embedding chunk |
+| `KNOWLEDGE_EMBEDDING_CHUNK_OVERLAP_CHARS` | `200` | Overlap between chunks (characters) |
+| `KNOWLEDGE_EMBEDDING_LINK_CONTEXT_MAX_CHARS` | `320` | Max characters for link-context embeddings |
+| `KNOWLEDGE_EMBEDDING_LINK_CONTEXT_WEIGHT` | `0.7` | Weight applied to link-context similarity |
+| `KNOWLEDGE_EMBEDDING_INCLUDE_LINK_CONTEXT` | `true` | Include link-context embeddings |
 
 ## MCP Tools
 
@@ -78,6 +83,14 @@ Environment variables:
 | `get_backlinks` | Get all notes linking to a specific note |
 | `get_links` | Get all outgoing links from a note |
 | `get_graph_stats` | Get knowledge graph statistics |
+
+### Semantic Search Behavior
+
+- Long notes are chunked with overlap; note scores aggregate across chunks.
+- A link-context embedding (outgoing links + backlinks) is added per note.
+- Results expand through link neighbors (backlinks + outgoing links).
+- Notes under `archive/` and journal-like notes (e.g., `index`, `journal/`, `daily/`)
+  are gently downranked.
 
 ## Development
 

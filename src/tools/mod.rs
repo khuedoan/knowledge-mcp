@@ -8,6 +8,7 @@
 //! - File system watching for live vault updates
 //! - Semantic search using local embeddings
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use rmcp::{
@@ -25,12 +26,43 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::cache::ContentCache;
 use crate::config::Config;
-use crate::embedding::{EmbeddingConfig, EmbeddingIndex, vault_id_from_path};
+use crate::embedding::{EmbeddingConfig, EmbeddingIndex, EmbeddingInput, vault_id_from_path};
 use crate::filter::SensitiveDataFilter;
 use crate::graph::KnowledgeGraph;
 use crate::search::{self, SearchOptions};
 use crate::vault::{BrokenLink, Vault};
 use crate::watcher::{FileWatcher, VaultChange};
+
+const GRAPH_EXPANSION_TOP_K: usize = 5;
+const GRAPH_EXPANSION_WEIGHT: f32 = 0.15;
+const ARCHIVE_SCORE_MULTIPLIER: f32 = 0.7;
+const JOURNAL_SCORE_MULTIPLIER: f32 = 0.85;
+
+fn path_has_component(path: &std::path::Path, component: &str) -> bool {
+    path.components().any(|part| {
+        part.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(component)
+    })
+}
+
+fn note_score_multiplier(note: &crate::vault::Note) -> f32 {
+    let mut multiplier = 1.0;
+
+    if path_has_component(&note.path, "archive") {
+        multiplier *= ARCHIVE_SCORE_MULTIPLIER;
+    }
+
+    let is_journal = note.name.eq_ignore_ascii_case("index")
+        || path_has_component(&note.path, "journal")
+        || path_has_component(&note.path, "daily");
+
+    if is_journal {
+        multiplier *= JOURNAL_SCORE_MULTIPLIER;
+    }
+
+    multiplier
+}
 
 /// The knowledge vault MCP server handler.
 #[derive(Clone)]
@@ -85,7 +117,11 @@ impl KnowledgeServer {
 
         let embedding_config = EmbeddingConfig {
             max_content_chars: self.config.embedding_max_chars,
+            chunk_overlap_chars: self.config.embedding_chunk_overlap_chars,
             include_headings: true,
+            include_link_context: self.config.embedding_include_link_context,
+            link_context_max_chars: self.config.embedding_link_context_max_chars,
+            link_context_weight: self.config.embedding_link_context_weight,
             cache_dir: self.config.cache_dir.clone(),
         };
 
@@ -95,6 +131,7 @@ impl KnowledgeServer {
 
         // Embed all notes
         let vault = self.vault.read().await;
+        let graph = KnowledgeGraph::from_vault(&vault);
         let mut notes_to_embed = Vec::new();
 
         for note in vault.notes() {
@@ -106,21 +143,19 @@ impl KnowledgeServer {
                     .map_err(|e| e.to_string())?
             };
 
-            if index.needs_update(&note.name, &content) {
-                notes_to_embed.push((note, content));
-            }
+            let backlinks = graph.backlinks(&note.name);
+            notes_to_embed.push(EmbeddingInput {
+                note: note.clone(),
+                content,
+                backlinks,
+            });
         }
 
         if !notes_to_embed.is_empty() {
             tracing::info!("Embedding {} notes...", notes_to_embed.len());
-
-            // Convert to references for batch embedding
-            let refs: Vec<_> = notes_to_embed
-                .iter()
-                .map(|(note, content)| (*note, content.as_str()))
-                .collect();
-
-            let count = index.embed_notes_batch(refs).map_err(|e| e.to_string())?;
+            let count = index
+                .embed_notes_batch(notes_to_embed)
+                .map_err(|e| e.to_string())?;
             tracing::info!("Embedded {} notes", count);
 
             // Save embeddings to cache
@@ -172,6 +207,7 @@ impl KnowledgeServer {
         let graph_cache = Arc::clone(&self.graph_cache);
         let content_cache = Arc::clone(&self.content_cache);
         let embedding_index = Arc::clone(&self.embedding_index);
+        let vault_id = vault_id_from_path(&self.config.vault_path);
         let handle = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -180,61 +216,195 @@ impl KnowledgeServer {
 
                         match &change {
                             VaultChange::Created(path) | VaultChange::Modified(path) => {
-                                // Update vault index
-                                let note_clone = {
+                                let note_name = path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.to_string());
+
+                                let impacted_notes = {
                                     let mut vault = vault.write().await;
+                                    let old_note = note_name
+                                        .as_ref()
+                                        .and_then(|name| vault.get_note(name).cloned());
+
                                     if let Err(e) = vault.upsert_note(path) {
                                         tracing::warn!("Failed to update note: {}", e);
                                         continue;
                                     }
 
-                                    // Get note name and clone note data if needed for embedding
-                                    path.file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .and_then(|name| vault.get_note(name).cloned())
+                                    let new_note = note_name
+                                        .as_ref()
+                                        .and_then(|name| vault.get_note(name).cloned());
+
+                                    let mut impacted = HashSet::new();
+                                    if let Some(name) = &note_name {
+                                        impacted.insert(name.clone());
+                                    }
+
+                                    if let Some(note) = &old_note {
+                                        for link in &note.links {
+                                            if !link.target.is_empty() {
+                                                impacted.insert(link.target.clone());
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(note) = &new_note {
+                                        for link in &note.links {
+                                            if !link.target.is_empty() {
+                                                impacted.insert(link.target.clone());
+                                            }
+                                        }
+                                    }
+
+                                    impacted
                                 };
 
-                                // Invalidate content cache
-                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                                // Invalidate content cache for the modified note.
+                                if let Some(name) = note_name.as_deref() {
                                     let mut cache = content_cache.write().await;
                                     cache.invalidate(name);
                                 }
 
-                                if let Some(note) = note_clone {
-                                    let content = {
-                                        let mut cache = content_cache.write().await;
-                                        cache.get_or_read(&note.name, path).ok()
-                                    };
+                                if !impacted_notes.is_empty() {
+                                    let vault_snapshot = vault.read().await;
+                                    let graph = KnowledgeGraph::from_vault(&vault_snapshot);
+                                    let mut inputs = Vec::new();
 
-                                    if let Some(content) = content {
+                                    for name in impacted_notes {
+                                        if let Some(note) = vault_snapshot.get_note(&name).cloned()
+                                        {
+                                            let content = {
+                                                let mut cache = content_cache.write().await;
+                                                cache.get_or_read(&note.name, &note.path).ok()
+                                            };
+
+                                            if let Some(content) = content {
+                                                let backlinks = graph.backlinks(&note.name);
+                                                inputs.push(EmbeddingInput {
+                                                    note,
+                                                    content,
+                                                    backlinks,
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    if !inputs.is_empty() {
                                         let mut index = embedding_index.write().await;
                                         if let Some(ref mut idx) = *index {
-                                            // Use block_in_place to avoid blocking the async
-                                            // runtime during ML inference
                                             let result = tokio::task::block_in_place(|| {
-                                                idx.embed_note(&note, &content)
+                                                idx.embed_notes_batch(inputs)
                                             });
-                                            if let Err(e) = result {
-                                                tracing::warn!("Failed to embed note: {}", e);
+                                            match result {
+                                                Ok(count) => {
+                                                    if count > 0 {
+                                                        if let Err(e) = idx.save(&vault_id) {
+                                                            tracing::warn!(
+                                                                "Failed to save embeddings: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("Failed to embed note: {}", e);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                             VaultChange::Removed(path) => {
-                                // Remove from vault index
-                                let mut vault = vault.write().await;
-                                vault.remove_note_by_path(path);
+                                let removed_name = path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.to_string());
 
-                                // Invalidate content cache
-                                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                                let impacted_notes = {
+                                    let mut vault = vault.write().await;
+                                    let removed_note = removed_name
+                                        .as_ref()
+                                        .and_then(|name| vault.get_note(name).cloned());
+
+                                    vault.remove_note_by_path(path);
+
+                                    let mut impacted = HashSet::new();
+                                    if let Some(note) = removed_note {
+                                        for link in note.links {
+                                            if !link.target.is_empty() {
+                                                impacted.insert(link.target);
+                                            }
+                                        }
+                                    }
+                                    impacted
+                                };
+
+                                if let Some(name) = removed_name.as_deref() {
                                     let mut cache = content_cache.write().await;
                                     cache.invalidate(name);
 
-                                    // Remove embedding
                                     let mut index = embedding_index.write().await;
                                     if let Some(ref mut idx) = *index {
                                         idx.remove(name);
+                                        if let Err(e) = idx.save(&vault_id) {
+                                            tracing::warn!(
+                                                "Failed to save embeddings after removal: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !impacted_notes.is_empty() {
+                                    let vault_snapshot = vault.read().await;
+                                    let graph = KnowledgeGraph::from_vault(&vault_snapshot);
+                                    let mut inputs = Vec::new();
+
+                                    for name in impacted_notes {
+                                        if let Some(note) = vault_snapshot.get_note(&name).cloned()
+                                        {
+                                            let content = {
+                                                let mut cache = content_cache.write().await;
+                                                cache.get_or_read(&note.name, &note.path).ok()
+                                            };
+
+                                            if let Some(content) = content {
+                                                let backlinks = graph.backlinks(&note.name);
+                                                inputs.push(EmbeddingInput {
+                                                    note,
+                                                    content,
+                                                    backlinks,
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    if !inputs.is_empty() {
+                                        let mut index = embedding_index.write().await;
+                                        if let Some(ref mut idx) = *index {
+                                            let result = tokio::task::block_in_place(|| {
+                                                idx.embed_notes_batch(inputs)
+                                            });
+                                            match result {
+                                                Ok(count) => {
+                                                    if count > 0 {
+                                                        if let Err(e) = idx.save(&vault_id) {
+                                                            tracing::warn!(
+                                                                "Failed to save embeddings: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "Failed to update embeddings: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -752,25 +922,56 @@ impl KnowledgeServer {
             ErrorData::internal_error("Embedding index not initialized.".to_string(), None)
         })?;
 
-        // Perform semantic search
-        let results = index
-            .search(&params.query, params.limit)
+        let base_limit = params.limit.max(GRAPH_EXPANSION_TOP_K * 4);
+
+        let base_results = index
+            .search(&params.query, base_limit)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        // Filter by threshold and get note titles
-        let vault = self.vault.read().await;
-        let results: Vec<SemanticSearchResult> = results
-            .into_iter()
-            .filter(|r| r.similarity >= params.threshold)
-            .map(|r| {
-                let title = vault.get_note(&r.name).and_then(|n| n.title.clone());
-                SemanticSearchResult {
-                    name: r.name,
-                    title,
-                    similarity: r.similarity,
-                }
-            })
+        let mut scores: std::collections::HashMap<String, f32> = base_results
+            .iter()
+            .map(|r| (r.name.clone(), r.similarity))
             .collect();
+
+        if !base_results.is_empty() {
+            let graph = self.get_graph().await?;
+            for seed in base_results.iter().take(GRAPH_EXPANSION_TOP_K) {
+                let mut neighbors = graph.backlinks(&seed.name);
+                neighbors.extend(graph.outgoing_links(&seed.name));
+
+                for neighbor in neighbors {
+                    if neighbor == seed.name {
+                        continue;
+                    }
+                    let boost = seed.similarity * GRAPH_EXPANSION_WEIGHT;
+                    let entry = scores.entry(neighbor).or_insert(0.0);
+                    *entry = (*entry + boost).min(1.0);
+                }
+            }
+        }
+
+        let vault = self.vault.read().await;
+        let mut results: Vec<SemanticSearchResult> = Vec::new();
+        for (name, score) in scores {
+            let note = match vault.get_note(&name) {
+                Some(note) => note,
+                None => continue,
+            };
+
+            let weighted_score = score * note_score_multiplier(note);
+            if weighted_score < params.threshold {
+                continue;
+            }
+
+            results.push(SemanticSearchResult {
+                name,
+                title: note.title.clone(),
+                similarity: weighted_score,
+            });
+        }
+
+        results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+        results.truncate(params.limit);
 
         let response = SemanticSearchResponse {
             query: params.query,
